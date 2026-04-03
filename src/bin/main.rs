@@ -6,16 +6,23 @@
     holding buffers for the duration of a data transfer."
 )]
 #![deny(clippy::large_stack_frames)]
-use core::sync::atomic::{AtomicU8, Ordering};
+#[allow(
+    clippy::large_stack_frames,
+    reason = "it's not unusual to allocate larger buffers etc. in main"
+)]
+use C99L_controller_panel::*; // 定数定義等.
+use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_can::{Frame, Id};
 use esp_backtrace as _;
+use esp_hal::uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart, UartTx};
 use esp_hal::{
     Async,
     clock::CpuClock,
-    gpio::{Input, InputConfig, Level, Output, OutputConfig},
+    gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     interrupt::software::SoftwareInterruptControl,
     system::Stack,
     timer::timg::TimerGroup,
@@ -23,79 +30,105 @@ use esp_hal::{
 };
 use esp_println::println;
 use esp_rtos::embassy::Executor;
+use heapless::String;
 use static_cell::StaticCell;
 
-// --- Time Definitions ---
-const MAIN_CONTROL_TIMEOUT_MS: u64 = 3000;
-const SAMPLING_RATE_MS: u64 = 25;
-
-// --- CAN ID Definitions ---
-const CAN_ID_BUTTON_STATE: u16 = 0x101;
-const CAN_ID_MAIN_VALVE_ANGLE: u16 = 0x102;
-const CAN_ID_FROM_PLC_ACK: u16 = 0x103;
-
-// チャタリング防止用(各bitがswのオンオフに対応)
+// チャタリング防止用(各bitがswのオンオフに対応).
 static BUTTON_STATE: AtomicU8 = AtomicU8::new(0);
+
+static VALVE_STATE: AtomicU8 = AtomicU8::new(0);
+static VALVE_ANGLE: AtomicU8 = AtomicU8::new(0);
+static CAN_ERROR: AtomicBool = AtomicBool::new(false);
+static LAST_RECEIVE_WATCH: Watch<CriticalSectionRawMutex, Instant, 2> = Watch::new();
+static VALVE_LAST_RECEIVE_WATCH: Watch<CriticalSectionRawMutex, Instant, 2> = Watch::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
-static CANOK: Signal<CriticalSectionRawMutex, bool> = Signal::new();
-
 #[embassy_executor::task]
 async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
     let mut data: u8 = 0;
     loop {
-        let state = AtomicU8::load(&BUTTON_STATE, Ordering::Relaxed);
+        let state = BUTTON_STATE.load(Ordering::Relaxed);
+        let fire = (state >> 1) & 1; // dataの2bit目は点火(fire).
+        let fill = (state >> 2) & 1; // dataの3bit目は充填(fill).
+        let separate = (state >> 3) & 1; // dataの4bit目は切り離し(separate).
+        let o2_test = (state >> 5) & 1; // dataの6bit目は試験用のo2.
         data = 0;
-        data |= state & 1; // dataの1bit目は機体内脱圧(dump)
-        data |= (state >> 1) & 1 << 1; // dataの2bit目は点火(fire)
-        data |= (state >> 2) & 1 << 2; // dataの3bit目は充填(fill)
-        data |= (state >> 3) & 1 << 3; // dataの4bit目は切り離し(separate)
-        data |= (state >> 4) & 1 << 4; // dataの5bit目はバルブセット(valve_set)
-        let frame_to_send =
+        data |= state & 1; // dataの1bit目は機体内脱圧(dump).
+        data |= (fire & !fill) << 1; // 充填中に点火しないように.
+        data |= fill << 2;
+        data |= (separate & !fill) << 3; // 充填中に切り離ししないように.
+        data |= state & (1 << 4); // dataの5bit目はバルブセット(valve set).
+        data |= (!fire & o2_test) << 5; // 点火中はo2_testを無効にする.
+        let regular_frame =
             EspTwaiFrame::new(StandardId::new(CAN_ID_BUTTON_STATE).unwrap(), &[data]).unwrap();
-        let _ = tx.transmit_async(&frame_to_send).await;
+        let result1 =
+            with_timeout(Duration::from_millis(50), tx.transmit_async(&regular_frame)).await;
+        match result1 {
+            //  指定時間内に終わらなかった (外側のResultがErr).
+            Err(_timeout_error) => {}
+
+            //  時間内に終わったが、通信エラーまたは切断が発生した (内側のResultがErr).
+            Ok(Err(can_err)) => {
+                println!("can_tx_err: {:?}", can_err);
+                CAN_ERROR.store(true, Ordering::Relaxed); // CAN送信エラー時はエラー状態に設定.
+            }
+            //  時間内に正常に受信完了 (両方ともOk).
+            Ok(Ok(())) => {}
+        }
+
         Timer::after(Duration::from_millis(50)).await;
     }
 }
 
 #[embassy_executor::task]
 async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
+    let time_sender = LAST_RECEIVE_WATCH.sender();
+    time_sender.send(Instant::now()); // 初期値をセット
+    let valve_time_sender = VALVE_LAST_RECEIVE_WATCH.sender();
+    valve_time_sender.send(Instant::now()); // 初期値をセット
     loop {
-        let frame = rx.receive_async().await;
-        match frame {
-            Ok(payload) => {
-                match payload.id() {
-                    Id::Standard(s_id) if s_id.as_raw() == CAN_ID_FROM_PLC_ACK => {
-                        CANOK.signal(true); // 正常にCAN受信したらエラー解除
+        let result = with_timeout(Duration::from_secs(3), rx.receive_async()).await;
+        match result {
+            Ok(frame_result) => match frame_result {
+                Ok(payload) => {
+                    match payload.id() {
+                        Id::Standard(s_id) if s_id.as_raw() == CAN_ID_FROM_PLC_ACK => {
+                            time_sender.send(Instant::now());
+                            CAN_ERROR.store(false, Ordering::Relaxed); // 正常にCAN受信したらエラー解除.
+                        }
+                        Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_STATE => {
+                            let can_data = payload.data();
+                            if can_data.len() > 1 {
+                                let valve_state = can_data[0];
+                                valve_time_sender.send(Instant::now());
+                                VALVE_STATE.store(valve_state, Ordering::Relaxed);
+                            }
+                        }
+                        Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_ANGLE => {
+                            let can_data = payload.data();
+                            if can_data.len() > 1 {
+                                let angle = can_data[0];
+                                valve_time_sender.send(Instant::now());
+                                VALVE_ANGLE.store(angle, Ordering::Relaxed);
+                            }
+                        }
+                        _ => {} // ignore the others
                     }
-                    Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_ANGLE => {
-                        let can_data = payload.data();
-                        let angle = can_data[0];
-                        if angle > 80 && angle < 120 {
-                            println!("Close! angle:{:?}", angle);
-                        } else if angle > 170 && angle < 210 {
-                            println!("Open! angle:{:?}", angle);
-                        } else {
-                            println!("Invalid angle:{:?}", angle)
-                        };
-                    }
-                    _ => {} // ignore the others
                 }
-            }
-            Err(e) => {
-                // CAN受信エラー時はLEDを点滅させる
-                println!("CAN receive error: {:?}", e);
-                CANOK.signal(false);
+                Err(_e) => {
+                    // CAN受信エラー時はLEDを点滅させる
+                    // println!("CAN receive error: {:?}", e);
+                    CAN_ERROR.store(true, Ordering::Relaxed); // CAN受信エラー時はエラー状態に設定.
+                }
+            },
+            Err(_) => {
+                // CAN受信エラー(timeout).
+                CAN_ERROR.store(true, Ordering::Relaxed);
             }
         }
-        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
@@ -107,6 +140,7 @@ async fn button_update_task(
     fill: Input<'static>,
     separate: Input<'static>,
     valve_set: Input<'static>,
+    o2: Input<'static>,
 ) {
     let mut state = 0;
     let mut prev = 0;
@@ -117,14 +151,64 @@ async fn button_update_task(
         state |= (fill.is_high() as u8) << 2;
         state |= (separate.is_high() as u8) << 3;
         state |= (valve_set.is_high() as u8) << 4;
+        state |= (o2.is_high() as u8) << 5;
         if state == prev {
-            AtomicU8::store(&BUTTON_STATE, prev, Ordering::Relaxed);
+            BUTTON_STATE.store(prev, Ordering::Relaxed);
         }
         prev = state;
-        Timer::after(Duration::from_millis(SAMPLING_RATE_MS)).await; // 25msごとに
+        Timer::after(Duration::from_millis(SAMPLING_RATE_MS)).await; // 25msごとに.
     }
 }
 
+#[embassy_executor::task]
+async fn pc_display_task(mut tx: UartTx<'static, Async>) {
+    loop {
+        let valve_com_state = VALVE_STATE.load(Ordering::Relaxed);
+        let angle = VALVE_ANGLE.load(Ordering::Relaxed);
+        let mut msg: String<64> = String::new();
+        let valve_state_str = match valve_com_state {
+            0 => "Normal",
+            1 => "Key off",
+            2 => "Communication Error",
+            3 => "VALVE-MAIN CAN Error",
+            4 => "VALVE-CONTROL CAN Error",
+            _ => "Unreachable",
+        };
+        let main_state_str = match valve_com_state {
+            0 => "Normal",
+            1 => "IGNITION",
+            2 => "TIMEOUT",
+            3 => "CONTROL-MAIN CAN Error",
+            _ => "Unreachable",
+        };
+        let angle_status = if angle > CLOSE_ANGLE - 20 && angle < CLOSE_ANGLE + 20 {
+            "Close!"
+        } else if angle > OPEN_ANGLE - 20 && angle < OPEN_ANGLE + 20 {
+            "Open!"
+        } else {
+            "Invalid"
+        };
+
+        if let Err(_) = write!(
+            msg,
+            "valve_com_state: {}, main_state: {}, MainAngle: {} ({}) \r\n",
+            valve_state_str, main_state_str, angle_status, angle
+        ) {
+            println!("Format error: buffer overflow");
+            continue;
+        }
+        // msg.as_bytes() で文字列を &[u8] に変換して送信する
+        match tx.write_async(msg.as_bytes()).await {
+            Ok(_n) => {
+                // println!("write success: {} bytes", n);
+            }
+            Err(_e) => {
+                // println!("UART1 write error: {:?}", e);
+            }
+        }
+        Timer::after(Duration::from_millis(1000)).await; // 1秒ごとにPCに状態を送信.
+    }
+}
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
@@ -139,20 +223,45 @@ async fn main(spawner: Spawner) -> ! {
     // --- pin definitions ---
     // GPIO 35,36,39 are input only pins.They can be used as switch pins.
     // GPIO34 is sw6. it is used as safety switch for emergency dump on controller panel
-    let dump = Input::new(peripherals.GPIO16, InputConfig::default()); // sch : SW1 機体外脱圧用
-    let fire = Input::new(peripherals.GPIO18, InputConfig::default()); // sch : SW2 イグナイター点火用
-    let fill = Input::new(peripherals.GPIO21, InputConfig::default()); // sch : SW3 充填用
-    let valve_set = Input::new(peripherals.GPIO19, InputConfig::default()); // sch : SW4 バルブセット用
-    let separate = Input::new(peripherals.GPIO17, InputConfig::default()); // sch : SW5 切り離し用
-    let mut state_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用
-    let o2 = Input::new(peripherals.GPIO34, InputConfig::default()); // sch : SW6 酸素電磁弁用(スイッチ増設用のスペア
+    let dump = Input::new(
+        peripherals.GPIO16,
+        InputConfig::default().with_pull(Pull::Down),
+    ); // sch : SW1 機体外脱圧用.
+    let fire = Input::new(
+        peripherals.GPIO18,
+        InputConfig::default().with_pull(Pull::Down),
+    ); // sch : SW2 イグナイター点火用.
+    let fill = Input::new(
+        peripherals.GPIO21,
+        InputConfig::default().with_pull(Pull::Down),
+    ); // sch : SW3 充填用.
+    let valve_set = Input::new(
+        peripherals.GPIO19,
+        InputConfig::default().with_pull(Pull::Down),
+    ); // sch : SW4 バルブセット用.
+    let separate = Input::new(
+        peripherals.GPIO17,
+        InputConfig::default().with_pull(Pull::Down),
+    ); // sch : SW5 切り離し用.
+    let uart1_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
+    let uart1_rx = Input::new(peripherals.GPIO32, InputConfig::default());
+    let mut state_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用.
+    let o2 = Input::new(peripherals.GPIO34, InputConfig::default()); // sch : SW6 酸素電磁弁用(スイッチ増設用のスペア.
     let can_tx = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
     let can_rx = Input::new(peripherals.GPIO27, InputConfig::default());
 
-    // Main_control の状態表示用
-    let mut counter: u8 = 0;
-    let mut last_receive_time: Instant = Instant::now();
+    let uart1_config = UartConfig::default()
+        .with_baudrate(115_200)
+        .with_data_bits(DataBits::_8)
+        .with_parity(Parity::None)
+        .with_stop_bits(StopBits::_1);
 
+    let uart1 = Uart::new(peripherals.UART1, uart1_config)
+        .unwrap()
+        .with_rx(uart1_rx)
+        .with_tx(uart1_tx)
+        .into_async();
+    let (_display_rx, display_tx) = uart1.split();
     //  Spawn some tasks
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -181,32 +290,61 @@ async fn main(spawner: Spawner) -> ! {
     );
                 let can = can_config.start();
                 let (rx, tx) = can.split();
-                spawner.spawn(can_receive_task(rx)).ok();
-                spawner.spawn(can_transmit_task(tx)).ok();
+                spawner
+                    .spawn(can_receive_task(rx))
+                    .expect("can_receive_task should spawn during setup");
+                spawner
+                    .spawn(can_transmit_task(tx))
+                    .expect("can_transmit_task should spawn during setup");
             });
         },
     );
     spawner
-        .spawn(button_update_task(dump, fire, fill, separate, valve_set))
-        .ok();
+        .spawn(button_update_task(
+            dump, fire, fill, separate, valve_set, o2,
+        ))
+        .expect("button_update_task should spawn during setup");
+    spawner
+        .spawn(pc_display_task(display_tx))
+        .expect("pc_display_task should spawn during setup");
+    let Some(mut time_receiver) = LAST_RECEIVE_WATCH.receiver() else {
+        println!("Failed to create time receiver");
+        loop {}
+    };
+    let Some(mut valve_time_receiver) = VALVE_LAST_RECEIVE_WATCH.receiver() else {
+        println!("Failed to create time receiver");
+        loop {}
+    };
+    let mut main_control_last_receive_time = Instant::now();
+    let mut valve_last_receive_time = Instant::now();
     loop {
-        if CANOK.wait().await {
-            last_receive_time = Instant::now();
+        if let Some(new_time) = time_receiver.try_get() {
+            main_control_last_receive_time = new_time;
         }
-        if last_receive_time.elapsed() <= Duration::from_millis(MAIN_CONTROL_TIMEOUT_MS) {
-            state_led.set_high();
+        if let Some(new_time) = valve_time_receiver.try_get() {
+            valve_last_receive_time = new_time;
+        }
+        let can_flag = CAN_ERROR.load(Ordering::Relaxed);
+
+        let is_main_timeout = main_control_last_receive_time.elapsed()
+            > Duration::from_millis(MAIN_CONTROL_TIMEOUT_MS);
+        let is_valve_timeout =
+            valve_last_receive_time.elapsed() > Duration::from_millis(VALVE_CONTROL_TIMEOUT_MS);
+
+        if is_valve_timeout {
+            VALVE_STATE.store(4, Ordering::Relaxed);
+        }
+
+        if can_flag {
+            // CANモジュール自体にエラー -> 消灯
+            state_led.set_low();
+        } else if is_main_timeout || is_valve_timeout {
+            // エラーは出ていないが、どちらか一方でもタイムアウトしている -> 点滅
+            state_led.toggle();
         } else {
-            if counter % 2 == 0 {
-                state_led.set_low();
-            } else {
-                state_led.set_high();
-            }
-            if counter >= 255 {
-                counter = 0;
-            } else {
-                counter += 1;
-            }
+            // 正常 -> 点灯
+            state_led.set_high();
         }
-        Timer::after(Duration::from_millis(100)).await;
+        Timer::after(Duration::from_millis(250)).await; // 250msごとに状態を更新.
     }
 }
