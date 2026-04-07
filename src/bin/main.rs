@@ -12,12 +12,24 @@
 )]
 use C99L_controller_panel::*; // 定数定義等.
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
+use display_interface_spi::SPIInterface;
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embassy_futures::select::{Either3, select3};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_can::{Frame, Id};
+use embedded_graphics::mono_font::MonoTextStyle;
+use embedded_graphics::pixelcolor::Rgb565;
+use embedded_graphics::prelude::*;
+use embedded_graphics::text::{Baseline, Text};
+use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
 use esp_backtrace as _;
+use esp_hal::delay::Delay;
+use esp_hal::spi::Mode as SpiMode;
+use esp_hal::spi::master::Config as SpiConfig;
+use esp_hal::spi::master::Spi;
+use esp_hal::time::Rate; // For specifying SPI frequency
 use esp_hal::uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart, UartTx};
 use esp_hal::{
     Async,
@@ -31,16 +43,19 @@ use esp_hal::{
 use esp_println::println;
 use esp_rtos::embassy::Executor;
 use heapless::String;
+use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use static_cell::StaticCell;
 
+// Larger font
+use profont::{PROFONT_18_POINT, PROFONT_24_POINT};
 // チャタリング防止用(各bitがswのオンオフに対応).
 static BUTTON_STATE: AtomicU8 = AtomicU8::new(0);
-
 static VALVE_STATE: AtomicU8 = AtomicU8::new(0);
 static VALVE_ANGLE: AtomicU8 = AtomicU8::new(0);
-static CAN_ERROR: AtomicBool = AtomicBool::new(false);
-static LAST_RECEIVE_WATCH: Watch<CriticalSectionRawMutex, Instant, 2> = Watch::new();
-static VALVE_LAST_RECEIVE_WATCH: Watch<CriticalSectionRawMutex, Instant, 2> = Watch::new();
+static MAIN_STATE: AtomicU8 = AtomicU8::new(0);
+
+static MAIN_RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+static VALVE_RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
@@ -62,6 +77,7 @@ async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
         data |= (separate & !fill) << 3; // 充填中に切り離ししないように.
         data |= state & (1 << 4); // dataの5bit目はバルブセット(valve set).
         data |= (!fire & o2_test) << 5; // 点火中はo2_testを無効にする.
+        data |= state & (1 << 6); // dataの7bit目はstate_reset.
         let regular_frame =
             EspTwaiFrame::new(StandardId::new(CAN_ID_BUTTON_STATE).unwrap(), &[data]).unwrap();
         let result1 =
@@ -73,22 +89,31 @@ async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
             //  時間内に終わったが、通信エラーまたは切断が発生した (内側のResultがErr).
             Ok(Err(can_err)) => {
                 println!("can_tx_err: {:?}", can_err);
-                CAN_ERROR.store(true, Ordering::Relaxed); // CAN送信エラー時はエラー状態に設定.
             }
             //  時間内に正常に受信完了 (両方ともOk).
             Ok(Ok(())) => {}
         }
 
+        let ack_frame =
+            EspTwaiFrame::new(StandardId::new(CAN_ID_TO_VALVE_ACK).unwrap(), &[0]).unwrap();
+        let result2 = with_timeout(Duration::from_millis(50), tx.transmit_async(&ack_frame)).await;
+        match result2 {
+            //  指定時間内に終わらなかった (外側のResultがErr).
+            Err(_timeout_error) => {}
+
+            //  時間内に終わったが、通信エラーまたは切断が発生した (内側のResultがErr).
+            Ok(Err(can_err)) => {
+                println!("can_tx_err: {:?}", can_err);
+            }
+            //  時間内に正常に受信完了 (両方ともOk).
+            Ok(Ok(())) => {}
+        }
         Timer::after(Duration::from_millis(50)).await;
     }
 }
 
 #[embassy_executor::task]
 async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
-    let time_sender = LAST_RECEIVE_WATCH.sender();
-    time_sender.send(Instant::now()); // 初期値をセット
-    let valve_time_sender = VALVE_LAST_RECEIVE_WATCH.sender();
-    valve_time_sender.send(Instant::now()); // 初期値をセット
     loop {
         let result = with_timeout(Duration::from_secs(3), rx.receive_async()).await;
         match result {
@@ -96,37 +121,34 @@ async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                 Ok(payload) => {
                     match payload.id() {
                         Id::Standard(s_id) if s_id.as_raw() == CAN_ID_FROM_PLC_ACK => {
-                            time_sender.send(Instant::now());
-                            CAN_ERROR.store(false, Ordering::Relaxed); // 正常にCAN受信したらエラー解除.
+                            MAIN_RX_SIGNAL.signal(());
+                            MAIN_STATE.store(payload.data()[0], Ordering::Relaxed);
                         }
                         Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_STATE => {
                             let can_data = payload.data();
                             if can_data.len() > 1 {
                                 let valve_state = can_data[0];
-                                valve_time_sender.send(Instant::now());
                                 VALVE_STATE.store(valve_state, Ordering::Relaxed);
                             }
                         }
                         Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_ANGLE => {
                             let can_data = payload.data();
                             if can_data.len() > 1 {
-                                let angle = can_data[0];
-                                valve_time_sender.send(Instant::now());
+                                let angle = can_data[0] - 130;
+                                VALVE_RX_SIGNAL.signal(());
                                 VALVE_ANGLE.store(angle, Ordering::Relaxed);
                             }
                         }
                         _ => {} // ignore the others
                     }
                 }
-                Err(_e) => {
+                Err(e) => {
                     // CAN受信エラー時はLEDを点滅させる
-                    // println!("CAN receive error: {:?}", e);
-                    CAN_ERROR.store(true, Ordering::Relaxed); // CAN受信エラー時はエラー状態に設定.
+                    println!("CAN receive error: {:?}", e);
                 }
             },
             Err(_) => {
                 // CAN受信エラー(timeout).
-                CAN_ERROR.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -141,6 +163,7 @@ async fn button_update_task(
     separate: Input<'static>,
     valve_set: Input<'static>,
     o2: Input<'static>,
+    main_reset: Input<'static>,
 ) {
     let mut state = 0;
     let mut prev = 0;
@@ -152,6 +175,7 @@ async fn button_update_task(
         state |= (separate.is_high() as u8) << 3;
         state |= (valve_set.is_high() as u8) << 4;
         state |= (o2.is_high() as u8) << 5;
+        state |= (main_reset.is_high() as u8) << 6;
         if state == prev {
             BUTTON_STATE.store(prev, Ordering::Relaxed);
         }
@@ -164,17 +188,17 @@ async fn button_update_task(
 async fn pc_display_task(mut tx: UartTx<'static, Async>) {
     loop {
         let valve_com_state = VALVE_STATE.load(Ordering::Relaxed);
-        let angle = VALVE_ANGLE.load(Ordering::Relaxed);
-        let mut msg: String<64> = String::new();
+        let angle = VALVE_ANGLE.load(Ordering::Relaxed) - 130;
+        let main_state = MAIN_STATE.load(Ordering::Relaxed);
+        let mut msg: String<128> = String::new();
         let valve_state_str = match valve_com_state {
             0 => "Normal",
-            1 => "Key off",
-            2 => "Communication Error",
-            3 => "VALVE-MAIN CAN Error",
-            4 => "VALVE-CONTROL CAN Error",
+            1 => "Communication Error",
+            2 => "VALVE-MAIN CAN Error",
+            3 => "VALVE-CONTROL CAN Error",
             _ => "Unreachable",
         };
-        let main_state_str = match valve_com_state {
+        let main_state_str = match main_state {
             0 => "Normal",
             1 => "IGNITION",
             2 => "TIMEOUT",
@@ -207,6 +231,30 @@ async fn pc_display_task(mut tx: UartTx<'static, Async>) {
             }
         }
         Timer::after(Duration::from_millis(1000)).await; // 1秒ごとにPCに状態を送信.
+    }
+}
+#[embassy_executor::task]
+async fn lcd_display_task(
+    mut display: Ili9341<
+        SPIInterface<
+            ExclusiveDevice<Spi<'static, Async>, Output<'static>, NoDelay>,
+            Output<'static>,
+        >,
+        Output<'static>,
+    >,
+) {
+    display.clear(Rgb565::WHITE).unwrap();
+    loop {
+        let text_style = MonoTextStyle::new(&PROFONT_24_POINT, Rgb565::RED);
+        Text::with_baseline("impl Rust", Point::new(50, 150), text_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
+
+        let text_style = MonoTextStyle::new(&PROFONT_18_POINT, Rgb565::CSS_DIM_GRAY);
+
+        Text::with_baseline("for ESP32", Point::new(60, 180), text_style, Baseline::Top)
+            .draw(&mut display)
+            .unwrap();
     }
 }
 #[esp_rtos::main]
@@ -243,6 +291,10 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO17,
         InputConfig::default().with_pull(Pull::Down),
     ); // sch : SW5 切り離し用.
+    let main_reset = Input::new(
+        peripherals.GPIO35,
+        InputConfig::default().with_pull(Pull::Down),
+    ); // main controlのstateを燃焼待機状態にリセットするためのスイッチ.
     let uart1_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
     let uart1_rx = Input::new(peripherals.GPIO32, InputConfig::default());
     let mut state_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用.
@@ -262,6 +314,34 @@ async fn main(spawner: Spawner) -> ! {
         .with_tx(uart1_tx)
         .into_async();
     let (_display_rx, display_tx) = uart1.split();
+
+    // Initialize SPI
+    let spi = Spi::new(
+        peripherals.SPI2,
+        SpiConfig::default()
+            .with_frequency(Rate::from_mhz(4))
+            .with_mode(SpiMode::_0),
+    )
+    .unwrap()
+    .into_async()
+    //CLK
+    .with_sck(peripherals.GPIO14)
+    //DIN
+    .with_mosi(peripherals.GPIO4);
+    let cs = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
+    let dc = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default());
+    let reset = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
+    let spi_dev = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
+    let interface = SPIInterface::new(spi_dev, dc);
+    let mut display = Ili9341::new(
+        interface,
+        reset,
+        &mut Delay::new(),
+        Orientation::Portrait,
+        DisplaySize240x320,
+    )
+    .unwrap();
+
     //  Spawn some tasks
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -296,55 +376,46 @@ async fn main(spawner: Spawner) -> ! {
                 spawner
                     .spawn(can_transmit_task(tx))
                     .expect("can_transmit_task should spawn during setup");
+                spawner
+                    .spawn(button_update_task(
+                        dump, fire, fill, separate, valve_set, o2, main_reset,
+                    ))
+                    .expect("button_update_task should spawn during setup");
             });
         },
     );
     spawner
-        .spawn(button_update_task(
-            dump, fire, fill, separate, valve_set, o2,
-        ))
-        .expect("button_update_task should spawn during setup");
+        .spawn(lcd_display_task(display))
+        .expect("lcd_display_task should spawn during setup");
     spawner
         .spawn(pc_display_task(display_tx))
         .expect("pc_display_task should spawn during setup");
-    let Some(mut time_receiver) = LAST_RECEIVE_WATCH.receiver() else {
-        println!("Failed to create time receiver");
-        loop {}
-    };
-    let Some(mut valve_time_receiver) = VALVE_LAST_RECEIVE_WATCH.receiver() else {
-        println!("Failed to create time receiver");
-        loop {}
-    };
-    let mut main_control_last_receive_time = Instant::now();
-    let mut valve_last_receive_time = Instant::now();
+    let timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
+    let mut main_deadline = Instant::now() + timeout_duration;
+    let mut valve_deadline = Instant::now() + timeout_duration;
     loop {
-        if let Some(new_time) = time_receiver.try_get() {
-            main_control_last_receive_time = new_time;
+        let next_timeout = main_deadline.min(valve_deadline);
+        match select3(
+            MAIN_RX_SIGNAL.wait(),
+            VALVE_RX_SIGNAL.wait(),
+            Timer::at(next_timeout),
+        )
+        .await
+        {
+            Either3::First(_) => {
+                main_deadline = Instant::now() + timeout_duration;
+                state_led.set_high();
+            }
+            Either3::Second(_) => {
+                valve_deadline = Instant::now() + timeout_duration;
+                state_led.set_high();
+            }
+            Either3::Third(_) => {
+                // タイムアウト
+                VALVE_STATE.store(4, Ordering::Relaxed);
+                // どちらか一方でもタイムアウトしている -> 点滅
+                state_led.toggle();
+            }
         }
-        if let Some(new_time) = valve_time_receiver.try_get() {
-            valve_last_receive_time = new_time;
-        }
-        let can_flag = CAN_ERROR.load(Ordering::Relaxed);
-
-        let is_main_timeout = main_control_last_receive_time.elapsed()
-            > Duration::from_millis(MAIN_CONTROL_TIMEOUT_MS);
-        let is_valve_timeout =
-            valve_last_receive_time.elapsed() > Duration::from_millis(VALVE_CONTROL_TIMEOUT_MS);
-
-        if is_valve_timeout {
-            VALVE_STATE.store(4, Ordering::Relaxed);
-        }
-
-        if can_flag {
-            // CANモジュール自体にエラー -> 消灯
-            state_led.set_low();
-        } else if is_main_timeout || is_valve_timeout {
-            // エラーは出ていないが、どちらか一方でもタイムアウトしている -> 点滅
-            state_led.toggle();
-        } else {
-            // 正常 -> 点灯
-            state_led.set_high();
-        }
-        Timer::after(Duration::from_millis(250)).await; // 250msごとに状態を更新.
     }
 }
