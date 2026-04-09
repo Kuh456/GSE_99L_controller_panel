@@ -1,7 +1,9 @@
 #![no_std]
+pub mod state;
+pub mod tasks;
 // --- Time Definitions ---
-pub const COMMUNICATION_TIMEOUT_MS: u64 = 3000; 
-pub const SAMPLING_RATE_MS: u64 = 25;
+pub const COMMUNICATION_TIMEOUT_MS: u64 = 3000;
+pub const SAMPLING_RATE_MS: u64 = 5;
 
 // --- CAN ID Definitions ---
 pub const CAN_ID_BUTTON_STATE: u16 = 0x101;
