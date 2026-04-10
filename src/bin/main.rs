@@ -180,11 +180,31 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::println!("setup done");
     let timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
-    let error_timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
+    let error_timeout_duration = Duration::from_millis(ERROR_COMMUNICATION_TIMEOUT_MS);
     let mut main_deadline = Instant::now() + timeout_duration;
     let mut valve_deadline = Instant::now() + timeout_duration;
     loop {
         let next_timeout = main_deadline.min(valve_deadline);
+        let now = Instant::now();
+        let mut is_timeout = false;
+        if now >= main_deadline {
+            esp_println::println!("main timeout");
+            main_deadline += error_timeout_duration; // MAINだけを更新
+            is_timeout = true;
+        }
+
+        if now >= valve_deadline {
+            esp_println::println!("valve timeout");
+            valve_deadline += error_timeout_duration; // VALVEだけを更新
+            is_timeout = true;
+        }
+        if is_timeout {
+            esp_println::println!("timeout");
+            VALVE_STATE.store(4, Ordering::Relaxed);
+            state_led.toggle();
+        }
+        let next_timeout = main_deadline.min(valve_deadline);
+
         match select3(
             MAIN_RX_SIGNAL.wait(),
             VALVE_RX_SIGNAL.wait(),
@@ -195,21 +215,19 @@ async fn main(spawner: Spawner) -> ! {
             Either3::First(_) => {
                 esp_println::println!("get main");
                 main_deadline = Instant::now() + timeout_duration;
-                state_led.set_high();
+                if Instant::now() < valve_deadline {
+                    state_led.set_high();
+                }
             }
             Either3::Second(_) => {
                 esp_println::println!("get valve");
                 valve_deadline = Instant::now() + timeout_duration;
-                state_led.set_high();
+                if Instant::now() < main_deadline {
+                    state_led.set_high();
+                }
             }
             Either3::Third(_) => {
-                esp_println::println!("timeout");
                 // タイムアウト
-                VALVE_STATE.store(4, Ordering::Relaxed);
-                // どちらか一方でもタイムアウトしている -> 点滅
-                state_led.toggle();
-                valve_deadline = Instant::now() + error_timeout_duration;
-                main_deadline = Instant::now() + error_timeout_duration;
             }
         }
     }

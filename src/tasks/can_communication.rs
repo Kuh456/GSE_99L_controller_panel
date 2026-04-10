@@ -32,7 +32,7 @@ pub async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
         println!("send: 0b{:08b}", data);
         send_can_message(&mut tx, CAN_ID_BUTTON_STATE, &[data]).await;
         send_can_message(&mut tx, CAN_ID_TO_VALVE_ACK, &[0]).await;
-        Timer::after(Duration::from_millis(50)).await;
+        Timer::after(Duration::from_millis(200)).await;
     }
 }
 
@@ -108,6 +108,7 @@ pub async fn receive_can_message(
         }
         Err(_) => {
             // タイムアウトは通常の待機状態なのでエラーログは出さない
+            Timer::after(Duration::from_millis(50)).await;
             None
         }
     }
