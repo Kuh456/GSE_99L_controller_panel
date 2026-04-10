@@ -8,8 +8,9 @@ use esp_hal::{
 use esp_println::println;
 
 use crate::{
-    CAN_ID_BUTTON_STATE, CAN_ID_FROM_PLC_ACK, CAN_ID_MAIN_VALVE_STATE, CAN_ID_TO_VALVE_ACK,
-    state::{BUTTON_STATE, MAIN_RX_SIGNAL, MAIN_STATE, VALVE_ANGLE, VALVE_STATE},
+    BUTTON_STATE, CAN_ID_BUTTON_STATE, CAN_ID_FROM_MAIN_ACK, CAN_ID_MAIN_VALVE_ANGLE,
+    CAN_ID_MAIN_VALVE_STATE, CAN_ID_TO_VALVE_ACK, MAIN_RX_SIGNAL, MAIN_STATE, VALVE_ANGLE,
+    VALVE_RX_SIGNAL, VALVE_STATE,
 };
 #[embassy_executor::task]
 pub async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
@@ -28,6 +29,7 @@ pub async fn can_transmit_task(mut tx: twai::TwaiTx<'static, Async>) {
         data |= state & (1 << 4); // dataの5bit目はバルブセット(valve set).
         data |= (!fire & o2_test) << 5; // 点火中はo2_testを無効にする.
         data |= state & (1 << 6); // dataの7bit目はstate_reset.
+        println!("send: 0b{:08b}", data);
         send_can_message(&mut tx, CAN_ID_BUTTON_STATE, &[data]).await;
         send_can_message(&mut tx, CAN_ID_TO_VALVE_ACK, &[0]).await;
         Timer::after(Duration::from_millis(50)).await;
@@ -40,7 +42,7 @@ pub async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
         // ラッパー関数から Option が返ってくるので、Some のときだけ処理
         if let Some(payload) = receive_can_message(&mut rx, 3).await {
             match payload.id() {
-                Id::Standard(s_id) if s_id.as_raw() == CAN_ID_FROM_PLC_ACK => {
+                Id::Standard(s_id) if s_id.as_raw() == CAN_ID_FROM_MAIN_ACK => {
                     MAIN_RX_SIGNAL.signal(());
                     MAIN_STATE.store(payload.data()[0], Ordering::Relaxed);
                 }
@@ -48,13 +50,14 @@ pub async fn can_receive_task(mut rx: twai::TwaiRx<'static, Async>) {
                     let can_data = payload.data();
                     if can_data.len() > 0 {
                         VALVE_STATE.store(can_data[0], Ordering::Relaxed);
+                        VALVE_RX_SIGNAL.signal(());
                     }
                 }
-                Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_STATE => {
+                Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_ANGLE => {
                     let can_data = payload.data();
                     if can_data.len() > 0 {
                         let angle = can_data[0] - 130;
-                        MAIN_RX_SIGNAL.signal(());
+                        VALVE_RX_SIGNAL.signal(());
                         VALVE_ANGLE.store(angle, Ordering::Relaxed);
                     }
                 }

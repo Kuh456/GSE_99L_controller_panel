@@ -1,7 +1,4 @@
-use crate::{
-    CLOSE_ANGLE, OPEN_ANGLE,
-    state::{MAIN_STATE, VALVE_ANGLE, VALVE_STATE},
-};
+use crate::{CLOSE_ANGLE, MAIN_STATE, OPEN_ANGLE, VALVE_ANGLE, VALVE_STATE};
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 use embassy_time::{Duration, Timer};

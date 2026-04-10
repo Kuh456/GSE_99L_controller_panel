@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 
-use crate::{SAMPLING_RATE_MS, state::BUTTON_STATE};
+use crate::{BUTTON_STATE, SAMPLING_RATE_MS};
 use embassy_time::{Duration, Timer};
 use esp_hal::gpio::Input;
 

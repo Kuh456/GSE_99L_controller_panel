@@ -11,7 +11,6 @@
     reason = "it's not unusual to allocate larger buffers etc. in main"
 )]
 use c99l_controller_panel::{
-    state::*, // 状態変数をインポート
     tasks::{button_update::*, can_communication::*, lcd_display::*, pc_display::*}, // 各タスクをインポート
     *, // 定数をインポート
 };
@@ -181,6 +180,7 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::println!("setup done");
     let timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
+    let error_timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
     let mut main_deadline = Instant::now() + timeout_duration;
     let mut valve_deadline = Instant::now() + timeout_duration;
     loop {
@@ -208,8 +208,8 @@ async fn main(spawner: Spawner) -> ! {
                 VALVE_STATE.store(4, Ordering::Relaxed);
                 // どちらか一方でもタイムアウトしている -> 点滅
                 state_led.toggle();
-                valve_deadline = Instant::now() + timeout_duration;
-                main_deadline = Instant::now() + timeout_duration;
+                valve_deadline = Instant::now() + error_timeout_duration;
+                main_deadline = Instant::now() + error_timeout_duration;
             }
         }
     }
