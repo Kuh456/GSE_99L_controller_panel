@@ -183,23 +183,26 @@ async fn main(spawner: Spawner) -> ! {
     let error_timeout_duration = Duration::from_millis(ERROR_COMMUNICATION_TIMEOUT_MS);
     let mut main_deadline = Instant::now() + timeout_duration;
     let mut valve_deadline = Instant::now() + timeout_duration;
+    let mut main_alive = false;
+    let mut valve_alive = false;
     loop {
-        let next_timeout = main_deadline.min(valve_deadline);
         let now = Instant::now();
         let mut is_timeout = false;
         if now >= main_deadline {
-            esp_println::println!("main timeout");
+            // esp_println::println!("main timeout");
             main_deadline += error_timeout_duration; // MAINだけを更新
+            main_alive = false;
             is_timeout = true;
         }
 
         if now >= valve_deadline {
-            esp_println::println!("valve timeout");
+            // esp_println::println!("valve timeout");
             valve_deadline += error_timeout_duration; // VALVEだけを更新
+            valve_alive = false;
             is_timeout = true;
         }
         if is_timeout {
-            esp_println::println!("timeout");
+            // esp_println::println!("timeout");
             VALVE_STATE.store(4, Ordering::Relaxed);
             state_led.toggle();
         }
@@ -213,22 +216,26 @@ async fn main(spawner: Spawner) -> ! {
         .await
         {
             Either3::First(_) => {
-                esp_println::println!("get main");
+                // esp_println::println!("get main");
                 main_deadline = Instant::now() + timeout_duration;
                 if Instant::now() < valve_deadline {
-                    state_led.set_high();
+                    valve_alive = true;
                 }
             }
             Either3::Second(_) => {
-                esp_println::println!("get valve");
+                // esp_println::println!("get valve");
                 valve_deadline = Instant::now() + timeout_duration;
                 if Instant::now() < main_deadline {
-                    state_led.set_high();
+                    main_alive = true;
                 }
             }
             Either3::Third(_) => {
                 // タイムアウト
             }
         }
+        if main_alive && valve_alive {
+            state_led.set_high();
+        }
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
