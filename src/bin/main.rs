@@ -17,7 +17,6 @@ use c99l_controller_panel::{
 use core::sync::atomic::Ordering;
 use display_interface_spi::SPIInterface;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either3, select3};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
@@ -50,7 +49,7 @@ async fn main(spawner: Spawner) -> ! {
     let peripherals = esp_hal::init(config);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
-    static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+    static APP_CORE_STACK: StaticCell<Stack<32768>> = StaticCell::new();
     let app_core_stack = APP_CORE_STACK.init(Stack::new());
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
 
@@ -180,37 +179,42 @@ async fn main(spawner: Spawner) -> ! {
 
     esp_println::println!("setup done");
     let timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
-    let error_timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
-    let mut main_deadline = Instant::now() + timeout_duration;
-    let mut valve_deadline = Instant::now() + timeout_duration;
+    let error_blink_interval = Duration::from_millis(ERROR_COMMUNICATION_TIMEOUT_MS);
+
+    let mut last_main_rx: Option<Instant> = None;
+    let mut last_valve_rx: Option<Instant> = None;
+
+    let mut toggle_deadline = Instant::now() + error_blink_interval;
+
     loop {
-        let next_timeout = main_deadline.min(valve_deadline);
-        match select3(
-            MAIN_RX_SIGNAL.wait(),
-            VALVE_RX_SIGNAL.wait(),
-            Timer::at(next_timeout),
-        )
-        .await
-        {
-            Either3::First(_) => {
-                esp_println::println!("get main");
-                main_deadline = Instant::now() + timeout_duration;
-                state_led.set_high();
-            }
-            Either3::Second(_) => {
-                esp_println::println!("get valve");
-                valve_deadline = Instant::now() + timeout_duration;
-                state_led.set_high();
-            }
-            Either3::Third(_) => {
-                esp_println::println!("timeout");
-                // タイムアウト
+        let now = Instant::now();
+
+        if MAIN_RX_FLAG.swap(false, Ordering::Relaxed) {
+            last_main_rx = Some(now);
+        }
+
+        if VALVE_RX_FLAG.swap(false, Ordering::Relaxed) {
+            last_valve_rx = Some(now);
+        }
+
+        let main_alive = last_main_rx.map_or(false, |t| t.elapsed() < timeout_duration);
+        let valve_alive = last_valve_rx.map_or(false, |t| t.elapsed() < timeout_duration);
+        if main_alive && valve_alive {
+            // 正常時：常時点灯
+            state_led.set_high();
+            toggle_deadline = now + error_blink_interval;
+        } else {
+            // エラー時：一定周期で点滅
+            if !valve_alive {
                 VALVE_STATE.store(4, Ordering::Relaxed);
-                // どちらか一方でもタイムアウトしている -> 点滅
+            }
+            if now >= toggle_deadline {
                 state_led.toggle();
-                valve_deadline = Instant::now() + error_timeout_duration;
-                main_deadline = Instant::now() + error_timeout_duration;
+                toggle_deadline = now + error_blink_interval;
             }
         }
+        esp_println::println!("main loop");
+
+        Timer::after(Duration::from_millis(100)).await;
     }
 }
