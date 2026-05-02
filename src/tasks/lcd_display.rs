@@ -12,16 +12,13 @@ use esp_hal::{Async, gpio::Output, spi::master::Spi};
 use ili9341::Ili9341;
 use profont::{PROFONT_18_POINT, PROFONT_24_POINT};
 
+type LcdDisplay = Ili9341<
+    SPIInterface<ExclusiveDevice<Spi<'static, Async>, Output<'static>, NoDelay>, Output<'static>>,
+    Output<'static>,
+>;
+
 #[embassy_executor::task]
-pub async fn lcd_display_task(
-    mut display: Ili9341<
-        SPIInterface<
-            ExclusiveDevice<Spi<'static, Async>, Output<'static>, NoDelay>,
-            Output<'static>,
-        >,
-        Output<'static>,
-    >,
-) {
+pub async fn lcd_display_task(mut display: LcdDisplay) {
     display.clear(Rgb565::WHITE).unwrap();
     loop {
         let text_style = MonoTextStyle::new(&PROFONT_24_POINT, Rgb565::RED);

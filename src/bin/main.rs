@@ -6,25 +6,14 @@
     holding buffers for the duration of a data transfer."
 )]
 #![deny(clippy::large_stack_frames)]
-#[allow(
-    clippy::large_stack_frames,
-    reason = "it's not unusual to allocate larger buffers etc. in main"
-)]
 use c99l_controller_panel::{
-    tasks::{button_update::*, can_communication::*, lcd_display::*, pc_display::*}, // 各タスクをインポート
-    *, // 定数をインポート
+    tasks::{button_update::*, can_communication::*, pc_display::*}, // 各タスクをインポート
+    *,                                                              // 定数をインポート
 };
 use core::sync::atomic::Ordering;
-use display_interface_spi::SPIInterface;
 use embassy_executor::Spawner;
 use embassy_time::{Duration, Instant, Timer};
-use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
-use esp_hal::delay::Delay;
-use esp_hal::spi::Mode as SpiMode;
-use esp_hal::spi::master::Config as SpiConfig;
-use esp_hal::spi::master::Spi;
-use esp_hal::time::Rate; // For specifying SPI frequency
 use esp_hal::uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart};
 use esp_hal::{
     clock::CpuClock,
@@ -35,23 +24,26 @@ use esp_hal::{
     twai::{self, BaudRate, TwaiMode, filter::SingleStandardFilter},
 };
 use esp_rtos::embassy::Executor;
-use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use static_cell::StaticCell;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
 // For more information see: <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/app_image_format.html#application-description>
 esp_bootloader_esp_idf::esp_app_desc!();
 
+#[allow(
+    clippy::large_stack_frames,
+    reason = "main owns peripheral initialization objects before moving them into tasks"
+)]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
     esp_println::logger::init_logger_from_env();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
     let peripherals = esp_hal::init(config);
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0);
-    static APP_CORE_STACK: StaticCell<Stack<32768>> = StaticCell::new();
-    let app_core_stack = APP_CORE_STACK.init(Stack::new());
     let sw_int = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+    esp_rtos::start(timg0.timer0, sw_int.software_interrupt0);
+    static APP_CORE_STACK: StaticCell<Stack<8192>> = StaticCell::new();
+    let app_core_stack = APP_CORE_STACK.init_with(Stack::new);
 
     // --- pin definitions ---
     // GPIO 35,36,39 are input only pins.They can be used as switch pins.
@@ -76,10 +68,10 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO17,
         InputConfig::default().with_pull(Pull::Down),
     ); // sch : SW5 切り離し用.
-    let main_reset = Input::new(
+    let valve_open = Input::new(
         peripherals.GPIO35,
         InputConfig::default().with_pull(Pull::Down),
-    ); // main controlのstateを燃焼待機状態にリセットするためのスイッチ.
+    ); // main_valveをopenさせるためのスイッチ.
     let uart1_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
     let uart1_rx = Input::new(peripherals.GPIO32, InputConfig::default());
     let mut state_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用.
@@ -100,50 +92,15 @@ async fn main(spawner: Spawner) -> ! {
         .into_async();
     let (_display_rx, display_tx) = uart1.split();
 
-    // Initialize SPI
-    let spi = Spi::new(
-        peripherals.SPI2,
-        SpiConfig::default()
-            .with_frequency(Rate::from_mhz(4))
-            .with_mode(SpiMode::_0),
-    )
-    .unwrap()
-    .into_async()
-    //CLK
-    .with_sck(peripherals.GPIO14)
-    //DIN
-    .with_mosi(peripherals.GPIO4);
-    let cs = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
-    let dc = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default());
-    let reset = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
-    let spi_dev = ExclusiveDevice::new_no_delay(spi, cs).unwrap();
-    let interface = SPIInterface::new(spi_dev, dc);
-    let display = Ili9341::new(
-        interface,
-        reset,
-        &mut Delay::new(),
-        Orientation::Portrait,
-        DisplaySize240x320,
-    )
-    .unwrap();
-
     //  Spawn some tasks
-    spawner
-        .spawn(button_update_task(
-            dump, fire, fill, separate, valve_set, o2, main_reset,
-        ))
-        .expect("button_update_task should spawn during setup");
-    // spawner
-    //     .spawn(lcd_display_task(display))
-    //     .expect("lcd_display_task should spawn during setup");
-    // spawner
-    //     .spawn(pc_display_task(display_tx))
-    //     .expect("pc_display_task should spawn during setup");
+    spawner.spawn(
+        button_update_task(dump, fire, fill, separate, valve_set, o2, valve_open)
+            .expect("button_update_task should spawn during setup"),
+    );
+    spawner.spawn(pc_display_task(display_tx).expect("pc_display_task should spawn during setup"));
 
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
-        #[cfg(target_arch = "xtensa")]
-        sw_int.software_interrupt0,
         sw_int.software_interrupt1,
         app_core_stack,
         move || {
@@ -151,7 +108,13 @@ async fn main(spawner: Spawner) -> ! {
             let executor = EXECUTOR.init(Executor::new());
             executor.run(|spawner| {
                 // CAN設定
-                const TWAI_BAUDRATE: twai::BaudRate = BaudRate::B125K;
+                const TWAI_BAUDRATE: twai::BaudRate = BaudRate::Custom(twai::TimingConfig {
+                    baud_rate_prescaler: 40,
+                    sync_jump_width: 3,
+                    tseg_1: 15,
+                    tseg_2: 4,
+                    triple_sample: false,
+                });
                 let mut can_config = twai::TwaiConfiguration::new(
                     peripherals.TWAI0,
                     can_rx,
@@ -167,17 +130,16 @@ async fn main(spawner: Spawner) -> ! {
     );
                 let can = can_config.start();
                 let (rx, tx) = can.split();
-                spawner
-                    .spawn(can_receive_task(rx))
-                    .expect("can_receive_task should spawn during setup");
-                spawner
-                    .spawn(can_transmit_task(tx))
-                    .expect("can_transmit_task should spawn during setup");
+                spawner.spawn(
+                    can_receive_task(rx).expect("can_receive_task should spawn during setup"),
+                );
+                spawner.spawn(
+                    can_transmit_task(tx).expect("can_transmit_task should spawn during setup"),
+                );
             });
         },
     );
 
-    esp_println::println!("setup done");
     let timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
     let error_blink_interval = Duration::from_millis(ERROR_COMMUNICATION_TIMEOUT_MS);
 
@@ -197,8 +159,9 @@ async fn main(spawner: Spawner) -> ! {
             last_valve_rx = Some(now);
         }
 
-        let main_alive = last_main_rx.map_or(false, |t| t.elapsed() < timeout_duration);
-        let valve_alive = last_valve_rx.map_or(false, |t| t.elapsed() < timeout_duration);
+        let main_alive = last_main_rx.is_some_and(|t| t.elapsed() < timeout_duration);
+        let valve_alive = last_valve_rx.is_some_and(|t| t.elapsed() < timeout_duration);
+        // esp_println::println!("main:{:?}, valve:{:?}", main_alive, valve_alive);
         if main_alive && valve_alive {
             // 正常時：常時点灯
             state_led.set_high();
@@ -206,14 +169,17 @@ async fn main(spawner: Spawner) -> ! {
         } else {
             // エラー時：一定周期で点滅
             if !valve_alive {
-                VALVE_STATE.store(4, Ordering::Relaxed);
+                VALVE_STATE.store(3, Ordering::Relaxed);
+            }
+            if !main_alive {
+                MAIN_STATE.store(4, Ordering::Relaxed);
             }
             if now >= toggle_deadline {
                 state_led.toggle();
                 toggle_deadline = now + error_blink_interval;
             }
         }
-        esp_println::println!("main loop");
+        // esp_println::println!("main loop");
 
         Timer::after(Duration::from_millis(100)).await;
     }

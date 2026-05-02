@@ -13,21 +13,20 @@ pub async fn button_update_task(
     separate: Input<'static>,
     valve_set: Input<'static>,
     o2: Input<'static>,
-    main_reset: Input<'static>,
+    valve_open: Input<'static>,
 ) {
-    let mut state = 0;
     // 過去4回分の状態を保存するリングバッファ.
     let mut history = [0u8; 4];
     let mut idx = 0;
     loop {
-        state = 0;
+        let mut state = 0;
         state |= dump.is_high() as u8;
         state |= (fire.is_high() as u8) << 1;
         state |= (fill.is_high() as u8) << 2;
         state |= (separate.is_high() as u8) << 3;
         state |= (valve_set.is_high() as u8) << 4;
         state |= (o2.is_high() as u8) << 5;
-        state |= (main_reset.is_high() as u8) << 6;
+        state |= (valve_open.is_high() as u8) << 6;
 
         // 履歴を更新.
         history[idx] = state;
