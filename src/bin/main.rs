@@ -12,6 +12,7 @@ use c99l_controller_panel::{
 };
 use core::sync::atomic::Ordering;
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either3, select3};
 use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart};
@@ -149,13 +150,38 @@ async fn main(spawner: Spawner) -> ! {
     let mut toggle_deadline = Instant::now() + error_blink_interval;
 
     loop {
-        let now = Instant::now();
+        let mut main_rx = false;
+        let mut valve_rx = false;
 
-        if MAIN_RX_FLAG.swap(false, Ordering::Relaxed) {
-            last_main_rx = Some(now);
+        match select3(
+            MAIN_RX_SIGNAL.wait(),
+            VALVE_RX_SIGNAL.wait(),
+            Timer::after(Duration::from_millis(100)),
+        )
+        .await
+        {
+            Either3::First(()) => {
+                main_rx = true;
+            }
+            Either3::Second(()) => {
+                valve_rx = true;
+            }
+            Either3::Third(()) => {
+                // Wake periodically to keep timeout detection running.
+            }
         }
 
-        if VALVE_RX_FLAG.swap(false, Ordering::Relaxed) {
+        let now = Instant::now();
+        if MAIN_RX_SIGNAL.try_take().is_some() {
+            main_rx = true;
+        }
+        if VALVE_RX_SIGNAL.try_take().is_some() {
+            valve_rx = true;
+        }
+        if main_rx {
+            last_main_rx = Some(now);
+        }
+        if valve_rx {
             last_valve_rx = Some(now);
         }
 
@@ -180,7 +206,5 @@ async fn main(spawner: Spawner) -> ! {
             }
         }
         // esp_println::println!("main loop");
-
-        Timer::after(Duration::from_millis(100)).await;
     }
 }

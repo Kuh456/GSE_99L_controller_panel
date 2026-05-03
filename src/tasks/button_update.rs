@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 
-use crate::{BUTTON_STATE, SAMPLING_RATE_MS};
+use crate::{BUTTON_STATE, ButtonFlags, SAMPLING_RATE_MS};
 use embassy_time::{Duration, Timer};
 use esp_hal::gpio::Input;
 
@@ -19,17 +19,31 @@ pub async fn button_update_task(
     let mut history = [0u8; 4];
     let mut idx = 0;
     loop {
-        let mut state = 0;
-        state |= dump.is_high() as u8;
-        state |= (fire.is_high() as u8) << 1;
-        state |= (fill.is_high() as u8) << 2;
-        state |= (separate.is_high() as u8) << 3;
-        state |= (valve_set.is_high() as u8) << 4;
-        state |= (o2.is_high() as u8) << 5;
-        state |= (valve_open.is_high() as u8) << 6;
+        let mut state = ButtonFlags::empty();
+        if dump.is_high() {
+            state.insert(ButtonFlags::DUMP);
+        }
+        if fire.is_high() {
+            state.insert(ButtonFlags::FIRE);
+        }
+        if fill.is_high() {
+            state.insert(ButtonFlags::FILL);
+        }
+        if separate.is_high() {
+            state.insert(ButtonFlags::SEPARATE);
+        }
+        if valve_set.is_high() {
+            state.insert(ButtonFlags::VALVE_SET);
+        }
+        if o2.is_high() {
+            state.insert(ButtonFlags::O2);
+        }
+        if valve_open.is_high() {
+            state.insert(ButtonFlags::VALVE_OPEN);
+        }
 
         // 履歴を更新.
-        history[idx] = state;
+        history[idx] = state.bits();
         idx = (idx + 1) % 4;
         // 4回のサンプリング(40ms間)すべてで1だったボタンのビットだけが1になる.
         let all_high = history[0] & history[1] & history[2] & history[3];
