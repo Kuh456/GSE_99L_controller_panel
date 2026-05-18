@@ -58,25 +58,26 @@ async fn main(spawner: Spawner) -> ! {
         InputConfig::default().with_pull(Pull::Down),
     ); // sch : SW2 イグナイター点火用.
     let fill = Input::new(
-        peripherals.GPIO21,
+        peripherals.GPIO34,
         InputConfig::default().with_pull(Pull::Down),
     ); // sch : SW3 充填用.
     let valve_set = Input::new(
-        peripherals.GPIO19,
+        peripherals.GPIO17,
         InputConfig::default().with_pull(Pull::Down),
     ); // sch : SW4 バルブセット用.
     let separate = Input::new(
-        peripherals.GPIO17,
-        InputConfig::default().with_pull(Pull::Down),
-    ); // sch : SW5 切り離し用.
-    let valve_open = Input::new(
         peripherals.GPIO35,
         InputConfig::default().with_pull(Pull::Down),
-    ); // main_valveをopenさせるためのスイッチ.
+    ); // sch : SW5 切り離し用.
+    let o2 = Input::new(peripherals.GPIO39, InputConfig::default()); // sch : SW6 酸素電磁弁用
+    let valve_open = Input::new(
+        peripherals.GPIO36,
+        InputConfig::default().with_pull(Pull::Down),
+    ); // sch: SW7 main_valveをopenさせるためのスイッチ.
+
     let uart1_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
     let uart1_rx = Input::new(peripherals.GPIO32, InputConfig::default());
     let mut state_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用.
-    let o2 = Input::new(peripherals.GPIO34, InputConfig::default()); // sch : SW6 酸素電磁弁用(スイッチ増設用のスペア.
     let can_tx = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
     let can_rx = Input::new(peripherals.GPIO27, InputConfig::default());
 
