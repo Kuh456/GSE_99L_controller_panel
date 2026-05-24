@@ -10,6 +10,7 @@ use c99l_controller_panel::{
     tasks::{button_update::*, can_communication::*, pc_display::*}, // 各タスクをインポート
     *,                                                              // 定数をインポート
 };
+
 use core::sync::atomic::Ordering;
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either3, select3};
@@ -131,12 +132,8 @@ async fn main(spawner: Spawner) -> ! {
         const { SingleStandardFilter::new(b"0xxxxxxxxxx", b"x", [b"xxxxxxxx", b"xxxxxxxx"]) },
     );
                 let can = can_config.start();
-                let (rx, tx) = can.split();
                 spawner.spawn(
-                    can_receive_task(rx).expect("can_receive_task should spawn during setup"),
-                );
-                spawner.spawn(
-                    can_transmit_task(tx).expect("can_transmit_task should spawn during setup"),
+                    can_manager_task(can).expect("can_manager_task should spawn during setup"),
                 );
             });
         },

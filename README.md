@@ -26,21 +26,20 @@ flowchart TB
     end
 
     subgraph CORE1["Core 1 / CAN executor"]
-        CANTX["can_transmit_task<br/>ButtonFlags -> 1 byte payload"]
+        CANMGR["can_manager_task<br/>TX/RX + TEC/REC monitor"]
         CANBUS[("CAN bus")]
-        CANRX["can_receive_task<br/>receive_async"]
 
-        CANTX -->|"CAN ID 0x101 / every 50 ms"| CANBUS
-        CANBUS --> CANRX
+        CANMGR -->|"CAN ID 0x101 / every 50 ms"| CANBUS
+        CANBUS -->|"receive_async"| CANMGR
     end
 
-    BUTTON_STATE -->|"AtomicU8 load"| CANTX
-    CANRX -->|"0x103: MAIN_STATE<br/>0x107: VALVE_STATE<br/>0x102: VALVE_ANGLE_X10"| STATE_ATOMICS
-    CANRX -->|"MAIN_RX_SIGNAL / VALVE_RX_SIGNAL"| MONITOR
+    BUTTON_STATE -->|"AtomicU8 load"| CANMGR
+    CANMGR -->|"0x103: MAIN_STATE<br/>0x107: VALVE_STATE<br/>0x102: VALVE_ANGLE_X10"| STATE_ATOMICS
+    CANMGR -->|"MAIN_RX_SIGNAL / VALVE_RX_SIGNAL"| MONITOR
     PCDISP -->|"UART1 115200 bps"| PC["PC display"]
 ```
 
-`button_update_task` と `pc_display_task` は `#[esp_rtos::main]` 側の executor で起動します。CAN の受信・送信タスクは `start_second_core` で起動した 2 コア目の executor で動きます。
+`button_update_task` と `pc_display_task` は `#[esp_rtos::main]` 側の executor で起動します。CAN は `start_second_core` で起動した 2 コア目の executor 上で `can_manager_task` が TWAI 本体を所有し、送信・受信・TEC/REC 監視・Bus-Off 検出をまとめて担当します。
 
 ## 各タスクの役割
 
@@ -62,9 +61,11 @@ GPIO16/18/21/17/19/34/35 のスイッチ状態を周期的に読み取ります�
 | 5 | `O2` | O2 |
 | 6 | `VALVE_OPEN` | メインバルブ開 |
 
-### `can_transmit_task`
+### `can_manager_task`
 
-`BUTTON_STATE` を `ButtonFlags::from_bits_truncate` で復元し、CAN 送信用の payload を作ります。送信 payload は従来通り 1 バイトの `u8` です。
+`Twai<'static, Async>` を split せずに所有し、CAN 送信、CAN 受信、エラーカウンタ監視、Bus-Off 検出、Bus-Off 中の送信抑制を 1 タスク内で行います。
+
+`BUTTON_STATE` を `ButtonFlags::from_bits_truncate` で復元し、CAN 送信用の payload を作ります。送信 payload は従来通り 1 バイトの `u8` です。生成した payload は CAN ID `0x101` で 50 ms ごとに送信します。
 
 送信時には安全条件を反映します。
 
@@ -76,11 +77,7 @@ GPIO16/18/21/17/19/34/35 のスイッチ状態を周期的に読み取ります�
 - `O2` は `FIRE` が押されていないときだけ送信
 - `VALVE_OPEN` はそのまま送信
 
-生成した 1 バイト payload は CAN ID `0x101` で 50 ms ごとに送信します。
-
-### `can_receive_task`
-
-CAN 受信を待ち、関係する Standard ID だけを処理します。
+受信は `receive_async` と周期タイマーを `select` し、受信待ちだけで送信周期や状態監視が止まらないようにします。関係する Standard ID だけを処理します。
 
 | CAN ID | 更新する状態 | 受信通知 |
 | --- | --- | --- |
@@ -89,6 +86,15 @@ CAN 受信を待ち、関係する Standard ID だけを処理します。
 | `0x102` | `VALVE_ANGLE_X10` | `VALVE_RX_SIGNAL` |
 
 `VALVE_ANGLE_X10` は CAN payload の先頭 2 バイトを little-endian の `i16` として読み取り、0.1 度単位の角度として保存します。受信時刻そのものはここでは保持せず、`Signal<()>` で通信監視ループへ受信イベントだけを通知します。
+
+`transmit_async` / `receive_async` の `Err` は握りつぶさず、送信/受信エラー回数と最新の TEC/REC、CAN 状態に反映します。RX FIFO の overrun または Bus-Off を検出した場合は `clear_receive_fifo()` で受信 FIFO を破棄できる構造です。
+
+CAN 異常時の挙動は以下です。
+
+- `Active` / `Warning`: 通常通り 50 ms 周期で送信
+- `Passive`: TEC/REC と状態を記録し、Bus-Off までは送信停止しない
+- `BusOff`: `transmit_async` を呼ばず送信停止
+- `Recovering`: TODO。`stop()` / `start()` による復旧手順は今後拡張
 
 ### `pc_display_task`
 
@@ -120,5 +126,11 @@ CAN 受信を待ち、関係する Standard ID だけを処理します。
 | `VALVE_ANGLE_X10` | `AtomicI32` | 0.1 度単位のバルブ角度 |
 | `MAIN_RX_SIGNAL` | `Signal<CriticalSectionRawMutex, ()>` | メイン基板 CAN 受信イベント |
 | `VALVE_RX_SIGNAL` | `Signal<CriticalSectionRawMutex, ()>` | バルブ系 CAN 受信イベント |
+| `CAN_HEALTH` | `AtomicU8` | `CanHealth` の現在値 |
+| `CAN_TEC` | `AtomicU8` | 最後に観測した transmit error counter |
+| `CAN_REC` | `AtomicU8` | 最後に観測した receive error counter |
+| `CAN_TX_ERROR_COUNT` | `AtomicU32` | `transmit_async` のエラー回数 |
+| `CAN_RX_ERROR_COUNT` | `AtomicU32` | `receive_async` のエラー回数 |
+| `CAN_MANAGER_HEARTBEAT` | `AtomicU32` | `can_manager_task` の起床回数 |
 
 `Atomic` は最新状態の共有に使い、`Signal` は受信イベントの通知だけに使います。受信回数は数えず、通信監視では最後に受信した時刻だけを見ます。
