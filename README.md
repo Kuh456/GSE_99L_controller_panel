@@ -2,7 +2,7 @@
 
 ESP32 向けの制御パネル用ファームウェアです。
 
-GPIO のスイッチ入力を読み取り、CAN通信で射点にある制御基板へ送信し、CAN で受信した制御基板・サーボの角度・通信の状態を UART1 経由で PC に表示します。
+GPIO のスイッチ入力を読み取り、CAN 通信で射点にある integrated board へ送信し、CAN で受信した integrated board の状態、GPIO 状態、メインバルブ角度を UART1 経由で PC に表示します。
 
 ## タスク構成
 
@@ -13,15 +13,15 @@ flowchart TB
         BUTTON["button_update_task<br/>8 ms sampling + debounce"]
         BUTTON_STATE[("BUTTON_STATE<br/>AtomicU8")]
         PCDISP["pc_display_task<br/>1 s periodic UART output"]
-        STATE_ATOMICS[("MAIN_STATE<br/>VALVE_STATE<br/>VALVE_ANGLE_X10")]
-        MONITOR["communication monitor<br/>Signal wait + timeout check"]
+        STATE_ATOMICS[("INTERNAL_STATUS_PHASE<br/>INTERNAL_STATUS_FLAGS<br/>OUTPUT_GPIO_STATUS<br/>INPUT_GPIO_STATUS<br/>VALVE_ANGLE_X10")]
+        CAN_EVENTS[("CAN_RX_EVENT_FLAGS<br/>AtomicU8")]
+        MONITOR["communication monitor<br/>peer timeout check"]
         LED["state LED"]
 
         GPIO --> BUTTON
         BUTTON -->|"debounced ButtonFlags bits"| BUTTON_STATE
         BUTTON_STATE -->|"latest button state"| PCDISP
         STATE_ATOMICS -->|"latest received state"| PCDISP
-        STATE_ATOMICS -->|"error state update / read"| MONITOR
         MONITOR --> LED
     end
 
@@ -29,23 +29,39 @@ flowchart TB
         CANMGR["can_manager_task<br/>TX/RX + TEC/REC monitor"]
         CANBUS[("CAN bus")]
 
-        CANMGR -->|"CAN ID 0x101 / every 50 ms"| CANBUS
+        CANMGR -->|"0x001 ButtonFromCtrlPanel / every 50 ms"| CANBUS
         CANBUS -->|"receive_async"| CANMGR
     end
 
     BUTTON_STATE -->|"AtomicU8 load"| CANMGR
-    CANMGR -->|"0x103: MAIN_STATE<br/>0x107: VALVE_STATE<br/>0x102: VALVE_ANGLE_X10"| STATE_ATOMICS
-    CANMGR -->|"MAIN_RX_SIGNAL / VALVE_RX_SIGNAL"| MONITOR
+    CANMGR -->|"0x101 angle<br/>0x103 output GPIO<br/>0x104 input GPIO<br/>0x105 internal status"| STATE_ATOMICS
+    CANMGR -->|"fetch_or receive event bits"| CAN_EVENTS
+    CANMGR -->|"MAIN_RX_SIGNAL / VALVE_RX_SIGNAL wake"| MONITOR
+    CAN_EVENTS -->|"swap(0) + last peer rx"| MONITOR
     PCDISP -->|"UART1 115200 bps"| PC["PC display"]
 ```
 
 `button_update_task` と `pc_display_task` は `#[esp_rtos::main]` 側の executor で起動します。CAN は `start_second_core` で起動した 2 コア目の executor 上で `can_manager_task` が TWAI 本体を所有し、送信・受信・TEC/REC 監視・Bus-Off 検出をまとめて担当します。
 
+## CAN protocol
+
+CAN protocol 定義は `src/can/protocol.rs` にあり、integrated board 側の `src/can/protocol.rs` と同じ ID / payload / DLC です。処理対象は Standard ID のみです。Extended ID、無関係な ID、DLC が期待値と違うフレームは状態更新に使いません。
+
+| CAN ID | message | DLC | payload |
+| --- | --- | --- | --- |
+| `0x001` | `ButtonFromCtrlPanel` | 1 | button flags raw `u8` |
+| `0x101` | `MainValveAngleToCtrlPanel` | 2 | little-endian `i16` `angle_x10` |
+| `0x103` | `OutputGpioStatus` | 1 | output GPIO bits `u8` |
+| `0x104` | `InputGpioStatus` | 1 | input GPIO bits `u8` |
+| `0x105` | `InternalStatus` | 2 | `[phase, flags]` |
+
+現行 protocol では `0x102` と `0x107` は使いません。
+
 ## 各タスクの役割
 
 ### `button_update_task`
 
-GPIO16/18/21/17/19/34/35 のスイッチ状態を周期的に読み取ります。読み取った状態は `ButtonFlags` として組み立て、`u8` のビット列として履歴バッファに保存します。
+GPIO16/18/34/17/35/39/36 のスイッチ状態を周期的に読み取ります。読み取った状態は `ButtonFlags` として組み立て、`u8` のビット列として履歴バッファに保存します。
 
 チャタリング除去は 4 サンプル分の `u8` 履歴で行います。4 回連続で High だったビットだけを ON、4 回連続で Low だったビットだけを OFF にし、それ以外の不安定なビットは前回値を維持します。確定した結果は `BUTTON_STATE: AtomicU8` に保存します。
 
@@ -65,7 +81,7 @@ GPIO16/18/21/17/19/34/35 のスイッチ状態を周期的に読み取ります�
 
 `Twai<'static, Async>` を split せずに所有し、CAN 送信、CAN 受信、エラーカウンタ監視、Bus-Off 検出、Bus-Off 中の送信抑制を 1 タスク内で行います。
 
-`BUTTON_STATE` を `ButtonFlags::from_bits_truncate` で復元し、CAN 送信用の payload を作ります。送信 payload は従来通り 1 バイトの `u8` です。生成した payload は CAN ID `0x101` で 50 ms ごとに送信します。
+`BUTTON_STATE` を `ButtonFlags::from_bits_truncate` で復元し、CAN 送信用の payload を作ります。送信 payload は 1 バイトの `u8` です。生成した payload は `GseCanMessage::ButtonFromCtrlPanel { raw }` として CAN ID `0x001` で 50 ms ごとに送信します。
 
 送信時には安全条件を反映します。
 
@@ -77,15 +93,26 @@ GPIO16/18/21/17/19/34/35 のスイッチ状態を周期的に読み取ります�
 - `O2` は `FIRE` が押されていないときだけ送信
 - `VALVE_OPEN` はそのまま送信
 
-受信は `receive_async` と周期タイマーを `select` し、受信待ちだけで送信周期や状態監視が止まらないようにします。関係する Standard ID だけを処理します。
+受信は `receive_async` と周期タイマーを `select` し、受信待ちだけで送信周期や状態監視が止まらないようにします。受信フレームは `GseCanMessage::decode_standard(id, data)` で DLC を確認してから状態更新します。
 
-| CAN ID | 更新する状態 | 受信通知 |
+| CAN ID | message | 更新する状態 | 受信通知 |
+| --- | --- | --- | --- |
+| `0x101` | `MainValveAngleToCtrlPanel` | `VALVE_ANGLE_X10` | `VALVE_RX_SIGNAL` |
+| `0x103` | `OutputGpioStatus` | `OUTPUT_GPIO_STATUS` | `VALVE_RX_SIGNAL` |
+| `0x104` | `InputGpioStatus` | `INPUT_GPIO_STATUS` | `MAIN_RX_SIGNAL` |
+| `0x105` | `InternalStatus` | `INTERNAL_STATUS_PHASE`, `INTERNAL_STATUS_FLAGS` | `MAIN_RX_SIGNAL` |
+
+`VALVE_ANGLE_X10` は CAN payload の 2 バイトを little-endian の `i16` として読み取り、0.1 度単位の角度として保存します。`can_manager_task` は受信時刻や alive/lost 判定を持たず、対象 CAN ID の状態更新後に `CAN_RX_EVENT_FLAGS` へ受信イベント bit を `fetch_or(..., Ordering::Release)` で立てます。`Signal<()>` は main 側の通信監視ループを起こす用途として使います。
+
+受信イベント bit は以下です。
+
+| bit | 名前 | 意味 |
 | --- | --- | --- |
-| `0x103` | `MAIN_STATE` | `MAIN_RX_SIGNAL` |
-| `0x107` | `VALVE_STATE` | `VALVE_RX_SIGNAL` |
-| `0x102` | `VALVE_ANGLE_X10` | `VALVE_RX_SIGNAL` |
-
-`VALVE_ANGLE_X10` は CAN payload の先頭 2 バイトを little-endian の `i16` として読み取り、0.1 度単位の角度として保存します。受信時刻そのものはここでは保持せず、`Signal<()>` で通信監視ループへ受信イベントだけを通知します。
+| 0 | `CAN_RX_EVENT_PEER` | 統合先 CAN ノードから対象フレームを受信 |
+| 1 | `CAN_RX_EVENT_INTERNAL_STATUS` | `InternalStatus` を受信 |
+| 2 | `CAN_RX_EVENT_OUTPUT_GPIO_STATUS` | `OutputGpioStatus` を受信 |
+| 3 | `CAN_RX_EVENT_VALVE_ANGLE` | `MainValveAngleToCtrlPanel` を受信 |
+| 4 | `CAN_RX_EVENT_INPUT_GPIO_STATUS` | `InputGpioStatus` を受信 |
 
 `transmit_async` / `receive_async` の `Err` は握りつぶさず、送信/受信エラー回数と最新の TEC/REC、CAN 状態に反映します。RX FIFO の overrun または Bus-Off を検出した場合は `clear_receive_fifo()` で受信 FIFO を破棄できる構造です。
 
@@ -96,41 +123,48 @@ CAN 異常時の挙動は以下です。
 - `BusOff`: `transmit_async` を呼ばず送信停止
 - `Recovering`: TODO。`stop()` / `start()` による復旧手順は今後拡張
 
+TWAI は `TWAI0`, `TwaiMode::Normal`, `BaudRate::B125K`, `into_async()`, `SingleStandardFilter::new(b"0xxxxxxxxxx", b"x", [b"xxxxxxxx", b"xxxxxxxx"])` で初期化します。CAN TX/RX GPIO は controller panel 基板配線の GPIO26/GPIO27 を維持します。
+
 ### `pc_display_task`
 
 1 秒ごとに UART1 へ状態表示を送信します。表示内容は以下です。
 
 - 燃焼済みかどうか
-- バルブ通信状態
-- メイン基板状態
+- CAN 通信状態
+- internal status flags
+- output/input GPIO status
+- internal phase
 - メインバルブ角度と `Open!` / `Close!` / `Invalid`
 - 各ボタンの ON/OFF
 
-`MAIN_STATE == 1` を一度でも受け取ると `burned` を `Done` として保持します。角度表示は `VALVE_ANGLE_X10` を 0.1 度単位で表示し、`OPEN_ANGLE` / `CLOSE_ANGLE` と許容範囲から状態文字列を決めます。
+`INTERNAL_STATUS_PHASE == 1` を一度でも受け取ると `burned` を `Done` として保持します。角度表示は `VALVE_ANGLE_X10` を 0.1 度単位で表示し、`MAIN_VALVE_OPEN_ANGLE_X10` / `MAIN_VALVE_CLOSED_ANGLE_X10` と許容範囲から状態文字列を決めます。
 
 ### `lcd_display_task`
 
 ### `main.rs` の通信監視ループ
 
-これは Embassy task ではありませんが、メイン executor 上で常に動く監視ループです。`MAIN_RX_SIGNAL` と `VALVE_RX_SIGNAL` を `select3` で待ち、受信した側の `last_main_rx` / `last_valve_rx` を更新します。100 ms タイマーでも起床し、最後の受信時刻から `COMMUNICATION_TIMEOUT_MS` を超えたかを判定します。
+これは Embassy task ではありませんが、メイン executor 上で常に動く監視ループです。`CAN_RX_EVENT_FLAGS.swap(0, Ordering::Acquire)` で受信イベントを読み取り、`CAN_RX_EVENT_PEER` が立っていた場合だけ `last_can_peer_rx: Option<Instant>` を `Instant::now()` で更新します。`MAIN_RX_SIGNAL` と `VALVE_RX_SIGNAL` は受信時刻の根拠にはせず、監視ループを起こすために `select3` で待ちます。
 
-メイン基板とバルブ系の両方が生きている場合は状態 LED を点灯し、どちらかがタイムアウトした場合は `ERROR_COMMUNICATION_TIMEOUT_MS` 周期で点滅します。タイムアウト時には `MAIN_STATE` または `VALVE_STATE` に通信エラー状態を書き込みます。
+統合先 CAN ノードは 1 つとして扱います。`last_can_peer_rx` が `None` の場合、最後の対象フレーム受信から `COMMUNICATION_TIMEOUT_MS`、現在は 1000 ms 以上経過した場合、または `CAN_HEALTH` が `BusOff` の場合は peer lost と判定します。peer alive の場合は状態 LED を点灯し、peer lost の場合は `ERROR_COMMUNICATION_TIMEOUT_MS` 周期で点滅します。
 
 ## 共有状態
 
 | 名前 | 型 | 用途 |
 | --- | --- | --- |
 | `BUTTON_STATE` | `AtomicU8` | デバウンス後のボタン状態 |
-| `MAIN_STATE` | `AtomicU8` | メイン基板状態 |
-| `VALVE_STATE` | `AtomicU8` | バルブ系状態 |
+| `INTERNAL_STATUS_PHASE` | `AtomicU8` | `InternalStatus.phase` |
+| `INTERNAL_STATUS_FLAGS` | `AtomicU8` | `InternalStatus.flags` |
+| `OUTPUT_GPIO_STATUS` | `AtomicU8` | `OutputGpioStatus.output_bits` |
+| `INPUT_GPIO_STATUS` | `AtomicU8` | `InputGpioStatus.input_bits` |
 | `VALVE_ANGLE_X10` | `AtomicI32` | 0.1 度単位のバルブ角度 |
-| `MAIN_RX_SIGNAL` | `Signal<CriticalSectionRawMutex, ()>` | メイン基板 CAN 受信イベント |
-| `VALVE_RX_SIGNAL` | `Signal<CriticalSectionRawMutex, ()>` | バルブ系 CAN 受信イベント |
+| `MAIN_RX_SIGNAL` | `Signal<CriticalSectionRawMutex, ()>` | main 系 CAN 受信イベント |
+| `VALVE_RX_SIGNAL` | `Signal<CriticalSectionRawMutex, ()>` | valve 系 CAN 受信イベント |
 | `CAN_HEALTH` | `AtomicU8` | `CanHealth` の現在値 |
 | `CAN_TEC` | `AtomicU8` | 最後に観測した transmit error counter |
 | `CAN_REC` | `AtomicU8` | 最後に観測した receive error counter |
 | `CAN_TX_ERROR_COUNT` | `AtomicU32` | `transmit_async` のエラー回数 |
-| `CAN_RX_ERROR_COUNT` | `AtomicU32` | `receive_async` のエラー回数 |
+| `CAN_RX_ERROR_COUNT` | `AtomicU32` | `receive_async` と invalid DLC のエラー回数 |
 | `CAN_MANAGER_HEARTBEAT` | `AtomicU32` | `can_manager_task` の起床回数 |
+| `CAN_RX_EVENT_FLAGS` | `AtomicU8` | main 側が peer 受信時刻を更新するための受信イベント bit |
 
-`Atomic` は最新状態の共有に使い、`Signal` は受信イベントの通知だけに使います。受信回数は数えず、通信監視では最後に受信した時刻だけを見ます。
+`Atomic` は最新状態の共有に使い、`Signal` は監視ループの起床に使います。受信回数は数えず、通信監視では main 側が `CAN_RX_EVENT_PEER` から更新した最後の peer 受信時刻だけを見ます。

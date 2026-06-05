@@ -13,7 +13,7 @@ use c99l_controller_panel::{
 
 use core::sync::atomic::Ordering;
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::select3;
 use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart};
@@ -48,8 +48,8 @@ async fn main(spawner: Spawner) -> ! {
     let app_core_stack = APP_CORE_STACK.init_with(Stack::new);
 
     // --- pin definitions ---
-    // GPIO 35,36,39 are input only pins.They can be used as switch pins.
-    // GPIO34 is sw6. it is used as safety switch for emergency dump on controller panel
+    // ESP32 GPIO34-39 are input-only and have no internal pull resistors.
+    // Switches on these pins require external pull-down resistors on the board.
     let dump = Input::new(
         peripherals.GPIO16,
         InputConfig::default().with_pull(Pull::Down),
@@ -58,23 +58,14 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.GPIO18,
         InputConfig::default().with_pull(Pull::Down),
     ); // sch : SW2 イグナイター点火用.
-    let fill = Input::new(
-        peripherals.GPIO34,
-        InputConfig::default().with_pull(Pull::Down),
-    ); // sch : SW3 充填用.
+    let fill = Input::new(peripherals.GPIO34, InputConfig::default()); // sch : SW3 充填用. external pull-down required.
     let valve_set = Input::new(
         peripherals.GPIO17,
         InputConfig::default().with_pull(Pull::Down),
     ); // sch : SW4 バルブセット用.
-    let separate = Input::new(
-        peripherals.GPIO35,
-        InputConfig::default().with_pull(Pull::Down),
-    ); // sch : SW5 切り離し用.
-    let o2 = Input::new(peripherals.GPIO39, InputConfig::default()); // sch : SW6 酸素電磁弁用
-    let valve_open = Input::new(
-        peripherals.GPIO36,
-        InputConfig::default().with_pull(Pull::Down),
-    ); // sch: SW7 main_valveをopenさせるためのスイッチ.
+    let separate = Input::new(peripherals.GPIO35, InputConfig::default()); // sch : SW5 切り離し用. external pull-down required.
+    let o2 = Input::new(peripherals.GPIO39, InputConfig::default()); // sch : SW6 酸素電磁弁用. external pull-down required.
+    let valve_open = Input::new(peripherals.GPIO36, InputConfig::default()); // sch: SW7 main_valve open switch. external pull-down required.
 
     let uart1_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
     let uart1_rx = Input::new(peripherals.GPIO32, InputConfig::default());
@@ -96,11 +87,12 @@ async fn main(spawner: Spawner) -> ! {
     let (_display_rx, display_tx) = uart1.split();
 
     //  Spawn some tasks
-    spawner.spawn(
-        button_update_task(dump, fire, fill, separate, valve_set, o2, valve_open)
-            .expect("button_update_task should spawn during setup"),
-    );
-    spawner.spawn(pc_display_task(display_tx).expect("pc_display_task should spawn during setup"));
+    let button_update = button_update_task(dump, fire, fill, separate, valve_set, o2, valve_open)
+        .expect("button_update_task token should be allocated during setup");
+    spawner.spawn(button_update);
+    let pc_display = pc_display_task(display_tx)
+        .expect("pc_display_task token should be allocated during setup");
+    spawner.spawn(pc_display);
 
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
@@ -111,13 +103,7 @@ async fn main(spawner: Spawner) -> ! {
             let executor = EXECUTOR.init(Executor::new());
             executor.run(|spawner| {
                 // CAN設定
-                const TWAI_BAUDRATE: twai::BaudRate = BaudRate::Custom(twai::TimingConfig {
-                    baud_rate_prescaler: 40,
-                    sync_jump_width: 3,
-                    tseg_1: 15,
-                    tseg_2: 4,
-                    triple_sample: false,
-                });
+                const TWAI_BAUDRATE: twai::BaudRate = BaudRate::B125K;
                 let mut can_config = twai::TwaiConfiguration::new(
                     peripherals.TWAI0,
                     can_rx,
@@ -128,81 +114,73 @@ async fn main(spawner: Spawner) -> ! {
                 .into_async();
                 // Partially filter the incoming messages to reduce overhead of receiving
                 // undesired messages
-                can_config.set_filter(
-        const { SingleStandardFilter::new(b"0xxxxxxxxxx", b"x", [b"xxxxxxxx", b"xxxxxxxx"]) },
-    );
+                can_config.set_filter(const {
+                    SingleStandardFilter::new(b"0xxxxxxxxxx", b"x", [b"xxxxxxxx", b"xxxxxxxx"])
+                });
                 let can = can_config.start();
-                spawner.spawn(
-                    can_manager_task(can).expect("can_manager_task should spawn during setup"),
-                );
+                let can_manager = can_manager_task(can)
+                    .expect("can_manager_task token should be allocated during setup");
+                spawner.spawn(can_manager);
             });
         },
     );
 
     let timeout_duration = Duration::from_millis(COMMUNICATION_TIMEOUT_MS);
+    let can_manager_timeout = Duration::from_millis(CAN_MANAGER_HEARTBEAT_TIMEOUT_MS);
     let error_blink_interval = Duration::from_millis(ERROR_COMMUNICATION_TIMEOUT_MS);
 
-    let mut last_main_rx: Option<Instant> = None;
-    let mut last_valve_rx: Option<Instant> = None;
+    let mut last_can_peer_rx: Option<Instant> = None;
+    let mut observed_can_manager_heartbeat = CAN_MANAGER_HEARTBEAT.load(Ordering::Relaxed);
+    let mut last_can_manager_progress = Instant::now();
 
     let mut toggle_deadline = Instant::now() + error_blink_interval;
 
     loop {
-        let mut main_rx = false;
-        let mut valve_rx = false;
-
-        match select3(
-            MAIN_RX_SIGNAL.wait(),
-            VALVE_RX_SIGNAL.wait(),
-            Timer::after(Duration::from_millis(100)),
-        )
-        .await
-        {
-            Either3::First(()) => {
-                main_rx = true;
-            }
-            Either3::Second(()) => {
-                valve_rx = true;
-            }
-            Either3::Third(()) => {
-                // Wake periodically to keep timeout detection running.
-            }
-        }
-
         let now = Instant::now();
-        if MAIN_RX_SIGNAL.try_take().is_some() {
-            main_rx = true;
-        }
-        if VALVE_RX_SIGNAL.try_take().is_some() {
-            valve_rx = true;
-        }
-        if main_rx {
-            last_main_rx = Some(now);
-        }
-        if valve_rx {
-            last_valve_rx = Some(now);
+        let can_rx_events = CAN_RX_EVENT_FLAGS.swap(0, Ordering::Acquire);
+        if can_rx_events & CAN_RX_EVENT_PEER != 0 {
+            last_can_peer_rx = Some(now);
         }
 
-        let main_alive = last_main_rx.is_some_and(|t| t.elapsed() < timeout_duration);
-        let valve_alive = last_valve_rx.is_some_and(|t| t.elapsed() < timeout_duration);
-        // esp_println::println!("main:{:?}, valve:{:?}", main_alive, valve_alive);
-        if main_alive && valve_alive {
+        let can_manager_heartbeat = CAN_MANAGER_HEARTBEAT.load(Ordering::Relaxed);
+        if can_manager_heartbeat != observed_can_manager_heartbeat {
+            observed_can_manager_heartbeat = can_manager_heartbeat;
+            last_can_manager_progress = now;
+        }
+        let can_manager_alive = now.duration_since(last_can_manager_progress) < can_manager_timeout;
+
+        let can_bus_off = CAN_HEALTH.load(Ordering::Relaxed) == CanHealth::BusOff as u8;
+        let can_peer_alive =
+            last_can_peer_rx.is_some_and(|last_rx| now.duration_since(last_rx) < timeout_duration);
+        CAN_PEER_ALIVE.store(can_peer_alive, Ordering::Relaxed);
+
+        let can_local_error = if can_bus_off {
+            CanLocalError::BusOff
+        } else if !can_manager_alive {
+            CanLocalError::ManagerStalled
+        } else {
+            CanLocalError::None
+        };
+        CAN_LOCAL_ERROR.store(can_local_error as u8, Ordering::Relaxed);
+
+        if can_peer_alive && can_local_error == CanLocalError::None {
             // 正常時：常時点灯
             state_led.set_high();
             toggle_deadline = now + error_blink_interval;
         } else {
             // エラー時：一定周期で点滅
-            if !valve_alive {
-                VALVE_STATE.store(3, Ordering::Relaxed);
-            }
-            if !main_alive {
-                MAIN_STATE.store(4, Ordering::Relaxed);
-            }
             if now >= toggle_deadline {
                 state_led.toggle();
                 toggle_deadline = now + error_blink_interval;
             }
         }
+
+        let _ = select3(
+            MAIN_RX_SIGNAL.wait(),
+            VALVE_RX_SIGNAL.wait(),
+            Timer::after(Duration::from_millis(100)),
+        )
+        .await;
         // esp_println::println!("main loop");
     }
 }

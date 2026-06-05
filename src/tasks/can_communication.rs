@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{Either3, select3};
-use embassy_time::{Duration, Ticker};
+use embassy_time::{Duration, Ticker, Timer};
 use embedded_can::{Frame, Id};
 use esp_hal::{
     Async,
@@ -8,14 +8,17 @@ use esp_hal::{
 };
 
 use crate::{
-    ANGLE_CAN_SIZE, BUTTON_STATE, ButtonFlags, CAN_HEALTH, CAN_ID_BUTTON_STATE, CAN_ID_MAIN_STATE,
-    CAN_ID_MAIN_VALVE_ANGLE, CAN_ID_MAIN_VALVE_STATE, CAN_MANAGER_HEARTBEAT, CAN_REC,
-    CAN_RX_ERROR_COUNT, CAN_TEC, CAN_TX_ERROR_COUNT, CanHealth, MAIN_RX_SIGNAL, MAIN_STATE,
-    VALVE_ANGLE_X10, VALVE_RX_SIGNAL, VALVE_STATE,
+    BUTTON_STATE, ButtonFlags, CAN_HEALTH, CAN_LOCAL_ERROR, CAN_MANAGER_HEARTBEAT, CAN_REC,
+    CAN_RX_ERROR_COUNT, CAN_RX_EVENT_FLAGS, CAN_RX_EVENT_INPUT_GPIO_STATUS,
+    CAN_RX_EVENT_INTERNAL_STATUS, CAN_RX_EVENT_OUTPUT_GPIO_STATUS, CAN_RX_EVENT_PEER,
+    CAN_RX_EVENT_VALVE_ANGLE, CAN_TEC, CAN_TX_ERROR_COUNT, CanHealth, CanLocalError,
+    INPUT_GPIO_STATUS, INTERNAL_STATUS_FLAGS, INTERNAL_STATUS_PHASE, MAIN_RX_SIGNAL,
+    OUTPUT_GPIO_STATUS, VALVE_ANGLE_X10, VALVE_RX_SIGNAL,
+    can::protocol::{CanDecodeError, GseCanMessage},
 };
 
 const BUTTON_TX_INTERVAL_MS: u64 = 50;
-const CAN_HEALTH_MONITOR_INTERVAL_MS: u64 = 10;
+const CAN_HEALTH_MONITOR_INTERVAL_MS: u64 = 100;
 const CAN_ERROR_WARNING_THRESHOLD: u8 = 96;
 const CAN_ERROR_PASSIVE_THRESHOLD: u8 = 128;
 
@@ -43,17 +46,22 @@ pub async fn can_manager_task(mut can: twai::Twai<'static, Async>) {
                 }
                 Err(error) => {
                     record_rx_error(error, &can);
-                    update_can_health(&can);
+                    if update_can_health(&can) == CanHealth::BusOff {
+                        // Prevent an immediately failing receive future from spinning.
+                        Timer::after(Duration::from_millis(CAN_HEALTH_MONITOR_INTERVAL_MS)).await;
+                    }
                 }
             },
             Either3::Second(()) => {
                 if update_can_health(&can) == CanHealth::BusOff {
-                    can.clear_receive_fifo();
                     continue;
                 }
 
                 let cmd = build_button_payload(BUTTON_STATE.load(Ordering::Relaxed));
-                if let Some(frame) = create_can_frame_to_send(CAN_ID_BUTTON_STATE, cmd) {
+                let message = GseCanMessage::ButtonFromCtrlPanel { raw: cmd };
+                if let Some(frame) = create_can_frame_to_send(message) {
+                    // TODO: RX and this heartbeat stop while transmit_async waits. Split
+                    // RX/TX tasks or bound TX waiting when the CAN architecture is revised.
                     match can.transmit_async(&frame).await {
                         Ok(()) => {
                             update_can_health(&can);
@@ -66,9 +74,7 @@ pub async fn can_manager_task(mut can: twai::Twai<'static, Async>) {
                 }
             }
             Either3::Third(()) => {
-                if update_can_health(&can) == CanHealth::BusOff {
-                    can.clear_receive_fifo();
-                }
+                update_can_health(&can);
             }
         }
     }
@@ -107,36 +113,57 @@ fn build_button_payload(raw_state: u8) -> u8 {
     data.bits()
 }
 
-fn create_can_frame_to_send(can_id: u16, cmd: u8) -> Option<EspTwaiFrame> {
-    let id = StandardId::new(can_id)?;
-    EspTwaiFrame::new(id, &[cmd])
+fn create_can_frame_to_send(message: GseCanMessage) -> Option<EspTwaiFrame> {
+    let id = StandardId::new(message.id())?;
+    let mut payload = [0; 8];
+    let dlc = message.encode_payload(&mut payload);
+    EspTwaiFrame::new(id, &payload[..dlc])
+}
+
+fn mark_peer_frame_received() {
+    CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_PEER, Ordering::Release);
+}
+
+fn record_invalid_peer_payload() {
+    CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 fn handle_received_frame(frame: &EspTwaiFrame) {
-    match frame.id() {
-        Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_STATE => {
-            let can_data = frame.data();
-            if !can_data.is_empty() {
-                MAIN_STATE.store(can_data[0], Ordering::Relaxed);
-                MAIN_RX_SIGNAL.signal(());
-            }
+    let id = match frame.id() {
+        Id::Standard(s_id) => s_id.as_raw(),
+        Id::Extended(_) => return,
+    };
+
+    match GseCanMessage::decode_standard(id, frame.data()) {
+        Ok(GseCanMessage::MainValveAngleToCtrlPanel { angle_x10 }) => {
+            mark_peer_frame_received();
+            VALVE_ANGLE_X10.store(i32::from(angle_x10), Ordering::Relaxed);
+            VALVE_RX_SIGNAL.signal(());
+            CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_VALVE_ANGLE, Ordering::Release);
         }
-        Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_STATE => {
-            let can_data = frame.data();
-            if !can_data.is_empty() {
-                VALVE_STATE.store(can_data[0], Ordering::Relaxed);
-                VALVE_RX_SIGNAL.signal(());
-            }
+        Ok(GseCanMessage::OutputGpioStatus { output_bits }) => {
+            mark_peer_frame_received();
+            OUTPUT_GPIO_STATUS.store(output_bits, Ordering::Relaxed);
+            VALVE_RX_SIGNAL.signal(());
+            CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_OUTPUT_GPIO_STATUS, Ordering::Release);
         }
-        Id::Standard(s_id) if s_id.as_raw() == CAN_ID_MAIN_VALVE_ANGLE => {
-            let can_data = frame.data();
-            if can_data.len() >= ANGLE_CAN_SIZE {
-                let angle_x10 = i16::from_le_bytes([can_data[0], can_data[1]]) as i32;
-                VALVE_ANGLE_X10.store(angle_x10, Ordering::Relaxed);
-                VALVE_RX_SIGNAL.signal(());
-            }
+        Ok(GseCanMessage::InputGpioStatus { input_bits }) => {
+            mark_peer_frame_received();
+            INPUT_GPIO_STATUS.store(input_bits, Ordering::Relaxed);
+            MAIN_RX_SIGNAL.signal(());
+            CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_INPUT_GPIO_STATUS, Ordering::Release);
         }
-        _ => {}
+        Ok(GseCanMessage::InternalStatus { phase, flags }) => {
+            mark_peer_frame_received();
+            INTERNAL_STATUS_PHASE.store(phase, Ordering::Relaxed);
+            INTERNAL_STATUS_FLAGS.store(flags, Ordering::Relaxed);
+            MAIN_RX_SIGNAL.signal(());
+            CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_INTERNAL_STATUS, Ordering::Release);
+        }
+        Ok(GseCanMessage::ButtonFromCtrlPanel { .. }) | Err(CanDecodeError::UnknownId(_)) => {}
+        Err(CanDecodeError::InvalidDlc { .. }) => {
+            record_invalid_peer_payload();
+        }
     }
 }
 
@@ -159,6 +186,9 @@ fn update_can_health(can: &twai::Twai<'static, Async>) -> CanHealth {
         }
     };
     CAN_HEALTH.store(health as u8, Ordering::Relaxed);
+    if health == CanHealth::BusOff {
+        CAN_LOCAL_ERROR.store(CanLocalError::BusOff as u8, Ordering::Relaxed);
+    }
     health
 }
 
@@ -176,8 +206,10 @@ fn handle_can_error(error: EspTwaiError, can: &twai::Twai<'static, Async>) {
     match error {
         EspTwaiError::BusOff => {
             CAN_HEALTH.store(CanHealth::BusOff as u8, Ordering::Relaxed);
-            can.clear_receive_fifo();
-            // TODO: Add an explicit stop/start recovery path after the reset policy is defined.
+            CAN_LOCAL_ERROR.store(CanLocalError::BusOff as u8, Ordering::Relaxed);
+            // Clearing the receive FIFO does not recover bus-off. Recovery requires TWAI
+            // stop/start, peripheral reinitialization, or a system reset.
+            // TODO: Define the safety reset/recovery policy before implementing recovery.
         }
         EspTwaiError::EmbeddedHAL(TwaiErrorKind::Overrun) => {
             can.clear_receive_fifo();

@@ -45,7 +45,7 @@ pub async fn button_update_task(
         // 履歴を更新.
         history[idx] = state.bits();
         idx = (idx + 1) % 4;
-        // 4回のサンプリング(40ms間)すべてで1だったボタンのビットだけが1になる.
+        // 4回のサンプリング(8ms x 4 = 32ms間)すべてで1だったボタンだけを採用.
         let all_high = history[0] & history[1] & history[2] & history[3];
 
         // 4回のサンプリングすべてで0だったボタンのビットだけが1になる.
