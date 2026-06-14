@@ -19,7 +19,7 @@ flowchart TB
         LED["state LED"]
 
         GPIO --> BUTTON
-        BUTTON -->|"debounced ButtonFlags bits"| BUTTON_STATE
+        BUTTON -->|"debounced physical ButtonFlags bits"| BUTTON_STATE
         BUTTON_STATE -->|"latest button state"| PCDISP
         STATE_ATOMICS -->|"latest received state"| PCDISP
         MONITOR --> LED
@@ -29,7 +29,7 @@ flowchart TB
         CANMGR["can_manager_task<br/>TX/RX + TEC/REC monitor"]
         CANBUS[("CAN bus")]
 
-        CANMGR -->|"0x001 ButtonFromCtrlPanel / every 50 ms"| CANBUS
+        CANMGR -->|"0x001 ButtonFromCtrlPanel / every 50 ms / TX timeout bounded"| CANBUS
         CANBUS -->|"receive_async"| CANMGR
     end
 
@@ -49,7 +49,7 @@ CAN protocol 定義は `src/can/protocol.rs` にあり、integrated board 側の
 
 | CAN ID | message | DLC | payload |
 | --- | --- | --- | --- |
-| `0x001` | `ButtonFromCtrlPanel` | 1 | button flags raw `u8` |
+| `0x001` | `ButtonFromCtrlPanel` | 1 | button flags / reset ack raw `u8` |
 | `0x101` | `MainValveAngleToCtrlPanel` | 2 | little-endian `i16` `angle_x10` |
 | `0x103` | `OutputGpioStatus` | 1 | output GPIO bits `u8` |
 | `0x104` | `InputGpioStatus` | 1 | input GPIO bits `u8` |
@@ -65,7 +65,7 @@ GPIO16/18/34/17/35/39/36 のスイッチ状態を周期的に読み取ります�
 
 チャタリング除去は 4 サンプル分の `u8` 履歴で行います。4 回連続で High だったビットだけを ON、4 回連続で Low だったビットだけを OFF にし、それ以外の不安定なビットは前回値を維持します。確定した結果は `BUTTON_STATE: AtomicU8` に保存します。
 
-ボタンのビット配置は CAN プロトコルと一致します。
+ボタンの bit0-6 は CAN プロトコルと一致します。bit7 `RESET_ACK` は物理ボタンではなく、`button_update_task` では立てません。
 
 | bit | flag | 内容 |
 | --- | --- | --- |
@@ -76,6 +76,9 @@ GPIO16/18/34/17/35/39/36 のスイッチ状態を周期的に読み取ります�
 | 4 | `VALVE_SET` | バルブセット |
 | 5 | `O2` | O2 |
 | 6 | `VALVE_OPEN` | メインバルブ開 |
+| 7 | `RESET_ACK` | Integrated Board の recoverable CAN fault 復帰用 software one-shot ack |
+
+`RESET_ACK` は `can_manager_task` が必要なときだけ送信する software ack です。Integrated Board が reset ack を `raw == 0x80` かつ bit7 の立ち上がり edge として扱うため、他の command bit と同時送信しません。
 
 ### `can_manager_task`
 
@@ -92,6 +95,14 @@ GPIO16/18/34/17/35/39/36 のスイッチ状態を周期的に読み取ります�
 - `VALVE_SET` はそのまま送信
 - `O2` は `FIRE` が押されていないときだけ送信
 - `VALVE_OPEN` はそのまま送信
+
+Integrated Board から受信した `InternalStatus.flags` に以下の recoverable CAN fault が含まれると、reset ack pending を立てます。
+
+- bit0 `CAN_PEER_LOST`
+- bit1 `CAN_BUS_OFF`
+- bit6 `CAN_TX_TIMEOUT`
+
+bit7 `CAN_TX_FRAME_CREATE_FAILED` はフレーム生成失敗を示すため、自動 ack 対象にしません。reset ack pending 中でも、物理ボタンから生成した通常 command payload が `0x00` のときだけ次の button frame で `0x80` 単独を送信します。送信成功後に pending を clear し、失敗または timeout 時は pending を維持します。
 
 受信は `receive_async` と周期タイマーを `select` し、受信待ちだけで送信周期や状態監視が止まらないようにします。受信フレームは `GseCanMessage::decode_standard(id, data)` で DLC を確認してから状態更新します。
 
@@ -114,7 +125,7 @@ GPIO16/18/34/17/35/39/36 のスイッチ状態を周期的に読み取ります�
 | 3 | `CAN_RX_EVENT_VALVE_ANGLE` | `MainValveAngleToCtrlPanel` を受信 |
 | 4 | `CAN_RX_EVENT_INPUT_GPIO_STATUS` | `InputGpioStatus` を受信 |
 
-`transmit_async` / `receive_async` の `Err` は握りつぶさず、送信/受信エラー回数と最新の TEC/REC、CAN 状態に反映します。RX FIFO の overrun または Bus-Off を検出した場合は `clear_receive_fifo()` で受信 FIFO を破棄できる構造です。
+`transmit_async` / `receive_async` の `Err` は握りつぶさず、送信/受信エラー回数と最新の TEC/REC、CAN 状態に反映します。`transmit_async` は 10 ms の timeout で待ちを打ち切り、timeout 時は `CAN_TX_ERROR_COUNT` を増やして `CAN_TX_TIMEOUT_ACTIVE` を立て、health を更新して loop に戻ります。これにより相手不在や ACK なしでも CAN task が送信待ちで固まり続けません。RX FIFO の overrun または Bus-Off を検出した場合は `clear_receive_fifo()` で受信 FIFO を破棄できる構造です。
 
 CAN 異常時の挙動は以下です。
 
@@ -137,7 +148,7 @@ TWAI は `TWAI0`, `TwaiMode::Normal`, `BaudRate::B125K`, `into_async()`, `Single
 - メインバルブ角度と `Open!` / `Close!` / `Invalid`
 - 各ボタンの ON/OFF
 
-`INTERNAL_STATUS_PHASE == 1` を一度でも受け取ると `burned` を `Done` として保持します。角度表示は `VALVE_ANGLE_X10` を 0.1 度単位で表示し、`MAIN_VALVE_OPEN_ANGLE_X10` / `MAIN_VALVE_CLOSED_ANGLE_X10` と許容範囲から状態文字列を決めます。
+`INTERNAL_STATUS_PHASE` は `0 => Idle`, `1 => Firing`, `2 => Timeout`, `3 => Abort` として表示します。現状の Integrated Board firmware では正常終了も phase=2 として扱われるため、phase=2 を受信した時点で `burned` を `Done` として保持します。角度表示は `VALVE_ANGLE_X10` を 0.1 度単位で表示し、`MAIN_VALVE_OPEN_ANGLE_X10` / `MAIN_VALVE_CLOSED_ANGLE_X10` と許容範囲から状態文字列を決めます。
 
 ### `lcd_display_task`
 
@@ -166,5 +177,6 @@ TWAI は `TWAI0`, `TwaiMode::Normal`, `BaudRate::B125K`, `into_async()`, `Single
 | `CAN_RX_ERROR_COUNT` | `AtomicU32` | `receive_async` と invalid DLC のエラー回数 |
 | `CAN_MANAGER_HEARTBEAT` | `AtomicU32` | `can_manager_task` の起床回数 |
 | `CAN_RX_EVENT_FLAGS` | `AtomicU8` | main 側が peer 受信時刻を更新するための受信イベント bit |
+| `CAN_TX_TIMEOUT_ACTIVE` | `AtomicBool` | 最新の CAN TX timeout 表示状態 |
 
 `Atomic` は最新状態の共有に使い、`Signal` は監視ループの起床に使います。受信回数は数えず、通信監視では main 側が `CAN_RX_EVENT_PEER` から更新した最後の peer 受信時刻だけを見ます。

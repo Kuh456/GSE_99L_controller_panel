@@ -8,6 +8,7 @@ pub mod tasks;
 pub const COMMUNICATION_TIMEOUT_MS: u64 = 1000;
 pub const ERROR_COMMUNICATION_TIMEOUT_MS: u64 = 300;
 pub const CAN_MANAGER_HEARTBEAT_TIMEOUT_MS: u64 = 500;
+pub const CAN_TX_TIMEOUT_MS: u64 = 10;
 pub const SAMPLING_RATE_MS: u64 = 8;
 
 pub const CAN_RX_EVENT_PEER: u8 = 1 << 0;
@@ -66,6 +67,7 @@ bitflags::bitflags! {
         const VALVE_SET = 1 << 4;
         const O2 = 1 << 5;
         const VALVE_OPEN = 1 << 6;
+        const RESET_ACK = 1 << 7;
     }
 }
 
@@ -88,3 +90,4 @@ pub static CAN_TX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_RX_ERROR_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_MANAGER_HEARTBEAT: AtomicU32 = AtomicU32::new(0);
 pub static CAN_RX_EVENT_FLAGS: AtomicU8 = AtomicU8::new(0);
+pub static CAN_TX_TIMEOUT_ACTIVE: AtomicBool = AtomicBool::new(false);

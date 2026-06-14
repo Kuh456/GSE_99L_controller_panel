@@ -150,6 +150,7 @@ async fn main(spawner: Spawner) -> ! {
         let can_manager_alive = now.duration_since(last_can_manager_progress) < can_manager_timeout;
 
         let can_bus_off = CAN_HEALTH.load(Ordering::Relaxed) == CanHealth::BusOff as u8;
+        let can_tx_timeout = CAN_TX_TIMEOUT_ACTIVE.load(Ordering::Relaxed);
         let can_peer_alive =
             last_can_peer_rx.is_some_and(|last_rx| now.duration_since(last_rx) < timeout_duration);
         CAN_PEER_ALIVE.store(can_peer_alive, Ordering::Relaxed);
@@ -163,7 +164,7 @@ async fn main(spawner: Spawner) -> ! {
         };
         CAN_LOCAL_ERROR.store(can_local_error as u8, Ordering::Relaxed);
 
-        if can_peer_alive && can_local_error == CanLocalError::None {
+        if can_peer_alive && can_local_error == CanLocalError::None && !can_tx_timeout {
             // 正常時：常時点灯
             state_led.set_high();
             toggle_deadline = now + error_blink_interval;
