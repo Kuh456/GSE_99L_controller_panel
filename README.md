@@ -57,6 +57,21 @@ CAN protocol 定義は `src/can/protocol.rs` にあり、integrated board 側の
 
 現行 protocol では `0x102` と `0x107` は使いません。
 
+`ButtonFromCtrlPanel` payload:
+
+| bit | flag | 内容 |
+| --- | --- | --- |
+| 0 | `DUMP` | DUMP |
+| 1 | `FIRE` | FIRE |
+| 2 | `FILL` | FILL |
+| 3 | `SEPARATE` | SEPARATE |
+| 4 | `VALVE_SET` | VALVE_SET |
+| 5 | `O2` | O2 |
+| 6 | `VALVE_OPEN` | VALVE_OPEN |
+| 7 | `RESET_ACK` | software one-shot reset ack |
+
+`RESET_ACK` は物理ボタンではなく、Integrated Board の recoverable CAN fault を解除するための software one-shot ack です。`RESET_ACK` は必ず `0x80` 単独で送り、他の command bit と同時送信しません。Integrated Board 側は bit7 の立ち上がり edge を見るため、`0x80` を連続送信せず、`0x80` の後は `0x00` または通常 command payload で bit7=0 の送信を挟みます。
+
 ## 各タスクの役割
 
 ### `button_update_task`
@@ -78,7 +93,7 @@ GPIO16/18/34/17/35/39/36 のスイッチ状態を周期的に読み取ります�
 | 6 | `VALVE_OPEN` | メインバルブ開 |
 | 7 | `RESET_ACK` | Integrated Board の recoverable CAN fault 復帰用 software one-shot ack |
 
-`RESET_ACK` は `can_manager_task` が必要なときだけ送信する software ack です。Integrated Board が reset ack を `raw == 0x80` かつ bit7 の立ち上がり edge として扱うため、他の command bit と同時送信しません。
+`RESET_ACK` は `can_manager_task` が必要なときだけ送信する software ack です。Integrated Board が reset ack を `raw == 0x80` かつ bit7 の立ち上がり edge として扱うため、他の command bit と同時送信せず、`0x80` を連続送信しません。
 
 ### `can_manager_task`
 
@@ -102,7 +117,7 @@ Integrated Board から受信した `InternalStatus.flags` に以下の recovera
 - bit1 `CAN_BUS_OFF`
 - bit6 `CAN_TX_TIMEOUT`
 
-bit7 `CAN_TX_FRAME_CREATE_FAILED` はフレーム生成失敗を示すため、自動 ack 対象にしません。reset ack pending 中でも、物理ボタンから生成した通常 command payload が `0x00` のときだけ次の button frame で `0x80` 単独を送信します。送信成功後に pending を clear し、失敗または timeout 時は pending を維持します。
+bit7 `CAN_TX_FRAME_CREATE_FAILED` はフレーム生成失敗を示すため、自動 ack 対象にしません。reset ack pending 中でも、物理ボタンから生成した通常 command payload が `0x00` のときだけ次の button frame で `0x80` 単独を送信します。`0x80` の送信を試した後は reset ack gap pending を立て、次の送信周期では `0x00` または通常 command payload により bit7=0 を挟みます。Integrated Board 側から受信した `InternalStatus.flags` で `CAN_PEER_LOST | CAN_BUS_OFF | CAN_TX_TIMEOUT` がすべて消えたことを確認したときだけ reset ack pending を clear します。
 
 受信は `receive_async` と周期タイマーを `select` し、受信待ちだけで送信周期や状態監視が止まらないようにします。受信フレームは `GseCanMessage::decode_standard(id, data)` で DLC を確認してから状態更新します。
 

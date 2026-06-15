@@ -49,8 +49,11 @@ pub async fn can_manager_task(mut can: twai::Twai<'static, Async>) {
         {
             Either3::First(receive_result) => match receive_result {
                 Ok(frame) => {
-                    if handle_received_frame(&frame) {
-                        reset_ack_pending = true;
+                    if let Some(has_fault) = handle_received_frame(&frame) {
+                        reset_ack_pending = has_fault;
+                        if !has_fault {
+                            reset_ack_gap_pending = false;
+                        }
                     }
                     update_can_health(&can);
                 }
@@ -86,7 +89,6 @@ pub async fn can_manager_task(mut can: twai::Twai<'static, Async>) {
                         Ok(Ok(())) => {
                             CAN_TX_TIMEOUT_ACTIVE.store(false, Ordering::Relaxed);
                             if send_reset_ack {
-                                reset_ack_pending = false;
                                 reset_ack_gap_pending = true;
                             } else if reset_ack_gap_pending {
                                 reset_ack_gap_pending = false;
@@ -94,10 +96,16 @@ pub async fn can_manager_task(mut can: twai::Twai<'static, Async>) {
                             update_can_health(&can);
                         }
                         Ok(Err(error)) => {
+                            if send_reset_ack {
+                                reset_ack_gap_pending = true;
+                            }
                             record_tx_error(error, &can);
                             update_can_health(&can);
                         }
                         Err(_) => {
+                            if send_reset_ack {
+                                reset_ack_gap_pending = true;
+                            }
                             record_tx_timeout(&can);
                         }
                     }
@@ -162,10 +170,10 @@ fn record_invalid_peer_payload() {
     CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-fn handle_received_frame(frame: &EspTwaiFrame) -> bool {
+fn handle_received_frame(frame: &EspTwaiFrame) -> Option<bool> {
     let id = match frame.id() {
         Id::Standard(s_id) => s_id.as_raw(),
-        Id::Extended(_) => return false,
+        Id::Extended(_) => return None,
     };
 
     match GseCanMessage::decode_standard(id, frame.data()) {
@@ -174,21 +182,21 @@ fn handle_received_frame(frame: &EspTwaiFrame) -> bool {
             VALVE_ANGLE_X10.store(i32::from(angle_x10), Ordering::Relaxed);
             VALVE_RX_SIGNAL.signal(());
             CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_VALVE_ANGLE, Ordering::Release);
-            false
+            None
         }
         Ok(GseCanMessage::OutputGpioStatus { output_bits }) => {
             mark_peer_frame_received();
             OUTPUT_GPIO_STATUS.store(output_bits, Ordering::Relaxed);
             VALVE_RX_SIGNAL.signal(());
             CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_OUTPUT_GPIO_STATUS, Ordering::Release);
-            false
+            None
         }
         Ok(GseCanMessage::InputGpioStatus { input_bits }) => {
             mark_peer_frame_received();
             INPUT_GPIO_STATUS.store(input_bits, Ordering::Relaxed);
             MAIN_RX_SIGNAL.signal(());
             CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_INPUT_GPIO_STATUS, Ordering::Release);
-            false
+            None
         }
         Ok(GseCanMessage::InternalStatus { phase, flags }) => {
             mark_peer_frame_received();
@@ -196,12 +204,12 @@ fn handle_received_frame(frame: &EspTwaiFrame) -> bool {
             INTERNAL_STATUS_FLAGS.store(flags, Ordering::Relaxed);
             MAIN_RX_SIGNAL.signal(());
             CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_INTERNAL_STATUS, Ordering::Release);
-            has_recoverable_can_fault(flags)
+            Some(has_recoverable_can_fault(flags))
         }
-        Ok(GseCanMessage::ButtonFromCtrlPanel { .. }) | Err(CanDecodeError::UnknownId(_)) => false,
+        Ok(GseCanMessage::ButtonFromCtrlPanel { .. }) | Err(CanDecodeError::UnknownId(_)) => None,
         Err(CanDecodeError::InvalidDlc { .. }) => {
             record_invalid_peer_payload();
-            false
+            None
         }
     }
 }

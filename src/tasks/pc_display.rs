@@ -73,7 +73,8 @@ pub async fn pc_display_task(mut tx: UartTx<'static, Async>) {
         let can_tx_timeout = CAN_TX_TIMEOUT_ACTIVE.load(Ordering::Relaxed);
         let can_health = CAN_HEALTH.load(Ordering::Relaxed);
         let buttons = ButtonFlags::from_bits_truncate(BUTTON_STATE.load(Ordering::Relaxed));
-        // Current Integrated Board firmware reports phase=2 for sequence end.
+        // Current Integrated Board firmware treats phase=2 as sequence end.
+        // If a dedicated Complete phase is added later, update this condition.
         if main_sequence_state == 2 {
             burned = true;
         }
