@@ -1,12 +1,13 @@
 use crate::{
     ANGLE_SCALE, ANGLE_STATUS_TOLERANCE_DEG, BUTTON_STATE, ButtonFlags, CAN_HEALTH,
     CAN_LOCAL_ERROR, CAN_PEER_ALIVE, CAN_TX_TIMEOUT_ACTIVE, CanHealth, CanLocalError,
-    INPUT_GPIO_STATUS, INTERNAL_STATUS_FLAGS, INTERNAL_STATUS_PHASE, MAIN_VALVE_CLOSED_ANGLE_X10,
-    MAIN_VALVE_OPEN_ANGLE_X10, OUTPUT_GPIO_STATUS, VALVE_ANGLE_X10,
+    INPUT_GPIO_STATUS, INTERNAL_STATUS_FLAGS, INTERNAL_STATUS_PHASE, LoggerDataFreshness,
+    MAIN_VALVE_CLOSED_ANGLE_X10, MAIN_VALVE_OPEN_ANGLE_X10, OUTPUT_GPIO_STATUS, VALVE_ANGLE_X10,
+    latest_logger_data, logger_data_freshness,
 };
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{Async, uart::UartTx};
 use esp_println::println;
 use heapless::String;
@@ -59,6 +60,14 @@ fn get_angle_status(angle_x10: i32) -> &'static str {
     "Invalid"
 }
 
+fn get_logger_data_status_str(freshness: LoggerDataFreshness) -> &'static str {
+    match freshness {
+        LoggerDataFreshness::NotReceived => "none",
+        LoggerDataFreshness::Fresh => "fresh",
+        LoggerDataFreshness::Stale => "stale",
+    }
+}
+
 #[embassy_executor::task]
 pub async fn pc_display_task(mut tx: UartTx<'static, Async>) {
     let mut burned: bool = false;
@@ -72,6 +81,8 @@ pub async fn pc_display_task(mut tx: UartTx<'static, Async>) {
         let can_local_error = CAN_LOCAL_ERROR.load(Ordering::Relaxed);
         let can_tx_timeout = CAN_TX_TIMEOUT_ACTIVE.load(Ordering::Relaxed);
         let can_health = CAN_HEALTH.load(Ordering::Relaxed);
+        let logger_data = latest_logger_data();
+        let logger_data_freshness = logger_data_freshness(Instant::now());
         let buttons = ButtonFlags::from_bits_truncate(BUTTON_STATE.load(Ordering::Relaxed));
         // Current Integrated Board firmware treats phase=2 as sequence end.
         // If a dedicated Complete phase is added later, update this condition.
@@ -79,39 +90,79 @@ pub async fn pc_display_task(mut tx: UartTx<'static, Async>) {
             burned = true;
         }
 
-        let mut msg: String<512> = String::new();
+        let mut msg: String<768> = String::new();
         let angle_status = get_angle_status(angle_x10);
         let angle_abs_x10 = angle_x10.abs();
 
-        let format_result = write!(
-            msg,
-            "burned: {}, can: {} (health: {})\r\n\
-             internal_flags: 0x{:02X}, output_gpio: 0x{:02X}, input_gpio: 0x{:02X}\r\n\
-             main_sequence: {}\r\n\
-             MainAngle: {} ({}{}.{}) \r\n\
-             DUMP:{}  FIRE:{}\r\n\
-             FILL:{}  SEP :{}\r\n\
-             SET :{}  O2  :{}\r\n\
-             VLV_OPN :{}\r\n",
-            if burned { "Done" } else { "Yet" },
-            get_can_status_str(can_peer_alive, can_local_error, can_tx_timeout),
-            get_can_health_str(can_health),
-            internal_status_flags,
-            output_gpio_status,
-            input_gpio_status,
-            get_main_sequence_state_str(main_sequence_state),
-            angle_status,
-            if angle_x10 < 0 { "-" } else { "" },
-            angle_abs_x10 / ANGLE_SCALE,
-            angle_abs_x10 % ANGLE_SCALE,
-            bit(buttons.contains(ButtonFlags::DUMP)),
-            bit(buttons.contains(ButtonFlags::FIRE)),
-            bit(buttons.contains(ButtonFlags::FILL)),
-            bit(buttons.contains(ButtonFlags::SEPARATE)),
-            bit(buttons.contains(ButtonFlags::VALVE_SET)),
-            bit(buttons.contains(ButtonFlags::O2)),
-            bit(buttons.contains(ButtonFlags::VALVE_OPEN)),
-        );
+        let format_result = if let Some(logger_data) = logger_data {
+            write!(
+                msg,
+                "burned: {}, can: {} (health: {})\r\n\
+                 logger: {} adc0:{} adc2:{} adc3:{} counter:{}\r\n\
+                 internal_flags: 0x{:02X}, output_gpio: 0x{:02X}, input_gpio: 0x{:02X}\r\n\
+                 main_sequence: {}\r\n\
+                 MainAngle: {} ({}{}.{}) \r\n\
+                 DUMP:{}  FIRE:{}\r\n\
+                 FILL:{}  SEP :{}\r\n\
+                 SET :{}  O2  :{}\r\n\
+                 VLV_OPN :{}\r\n",
+                if burned { "Done" } else { "Yet" },
+                get_can_status_str(can_peer_alive, can_local_error, can_tx_timeout),
+                get_can_health_str(can_health),
+                get_logger_data_status_str(logger_data_freshness),
+                logger_data.adc0,
+                logger_data.adc2,
+                logger_data.adc3,
+                logger_data.counter,
+                internal_status_flags,
+                output_gpio_status,
+                input_gpio_status,
+                get_main_sequence_state_str(main_sequence_state),
+                angle_status,
+                if angle_x10 < 0 { "-" } else { "" },
+                angle_abs_x10 / ANGLE_SCALE,
+                angle_abs_x10 % ANGLE_SCALE,
+                bit(buttons.contains(ButtonFlags::DUMP)),
+                bit(buttons.contains(ButtonFlags::FIRE)),
+                bit(buttons.contains(ButtonFlags::FILL)),
+                bit(buttons.contains(ButtonFlags::SEPARATE)),
+                bit(buttons.contains(ButtonFlags::VALVE_SET)),
+                bit(buttons.contains(ButtonFlags::O2)),
+                bit(buttons.contains(ButtonFlags::VALVE_OPEN)),
+            )
+        } else {
+            write!(
+                msg,
+                "burned: {}, can: {} (health: {})\r\n\
+                 logger: {}\r\n\
+                 internal_flags: 0x{:02X}, output_gpio: 0x{:02X}, input_gpio: 0x{:02X}\r\n\
+                 main_sequence: {}\r\n\
+                 MainAngle: {} ({}{}.{}) \r\n\
+                 DUMP:{}  FIRE:{}\r\n\
+                 FILL:{}  SEP :{}\r\n\
+                 SET :{}  O2  :{}\r\n\
+                 VLV_OPN :{}\r\n",
+                if burned { "Done" } else { "Yet" },
+                get_can_status_str(can_peer_alive, can_local_error, can_tx_timeout),
+                get_can_health_str(can_health),
+                get_logger_data_status_str(logger_data_freshness),
+                internal_status_flags,
+                output_gpio_status,
+                input_gpio_status,
+                get_main_sequence_state_str(main_sequence_state),
+                angle_status,
+                if angle_x10 < 0 { "-" } else { "" },
+                angle_abs_x10 / ANGLE_SCALE,
+                angle_abs_x10 % ANGLE_SCALE,
+                bit(buttons.contains(ButtonFlags::DUMP)),
+                bit(buttons.contains(ButtonFlags::FIRE)),
+                bit(buttons.contains(ButtonFlags::FILL)),
+                bit(buttons.contains(ButtonFlags::SEPARATE)),
+                bit(buttons.contains(ButtonFlags::VALVE_SET)),
+                bit(buttons.contains(ButtonFlags::O2)),
+                bit(buttons.contains(ButtonFlags::VALVE_OPEN)),
+            )
+        };
 
         if format_result.is_err() {
             println!("Format error: buffer overflow");

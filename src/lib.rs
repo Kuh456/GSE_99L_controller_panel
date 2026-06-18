@@ -1,6 +1,13 @@
 #![no_std]
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
+use core::{
+    cell::RefCell,
+    sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32},
+};
+use embassy_sync::{
+    blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
+    signal::Signal,
+};
+use embassy_time::{Duration, Instant};
 pub mod can;
 pub mod panic;
 pub mod tasks;
@@ -9,6 +16,7 @@ pub const COMMUNICATION_TIMEOUT_MS: u64 = 1000;
 pub const ERROR_COMMUNICATION_TIMEOUT_MS: u64 = 300;
 pub const CAN_MANAGER_HEARTBEAT_TIMEOUT_MS: u64 = 500;
 pub const CAN_TX_TIMEOUT_MS: u64 = 10;
+pub const LOGGER_DATA_TIMEOUT_MS: u64 = 1000;
 pub const SAMPLING_RATE_MS: u64 = 8;
 
 pub const CAN_RX_EVENT_PEER: u8 = 1 << 0;
@@ -16,6 +24,12 @@ pub const CAN_RX_EVENT_INTERNAL_STATUS: u8 = 1 << 1;
 pub const CAN_RX_EVENT_OUTPUT_GPIO_STATUS: u8 = 1 << 2;
 pub const CAN_RX_EVENT_VALVE_ANGLE: u8 = 1 << 3;
 pub const CAN_RX_EVENT_INPUT_GPIO_STATUS: u8 = 1 << 4;
+pub const CAN_RX_EVENT_LOGGER_DATA_NEW: u8 = 1 << 5;
+
+pub const IN_SOLENOID_POWER_PRESENT: u8 = 1 << 0;
+pub const IN_RELAY_12V_ON: u8 = 1 << 1;
+pub const IN_IGNITER_POWER_PRESENT: u8 = 1 << 2;
+pub const IN_RELAY_24V_ON: u8 = 1 << 3;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +46,60 @@ pub enum CanLocalError {
     None = 0,
     BusOff = 1,
     ManagerStalled = 2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoggerDataSnapshot {
+    pub adc0: u16,
+    pub adc2: u16,
+    pub adc3: u16,
+    pub counter: u16,
+    pub last_received: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoggerDataFreshness {
+    NotReceived,
+    Fresh,
+    Stale,
+}
+
+pub fn latest_logger_data() -> Option<LoggerDataSnapshot> {
+    LOGGER_DATA.lock(|data| *data.borrow())
+}
+
+pub fn logger_data_freshness(now: Instant) -> LoggerDataFreshness {
+    match latest_logger_data() {
+        None => LoggerDataFreshness::NotReceived,
+        Some(snapshot)
+            if now.duration_since(snapshot.last_received)
+                >= Duration::from_millis(LOGGER_DATA_TIMEOUT_MS) =>
+        {
+            LoggerDataFreshness::Stale
+        }
+        Some(_) => LoggerDataFreshness::Fresh,
+    }
+}
+
+pub fn update_logger_data(
+    adc0: u16,
+    adc2: u16,
+    adc3: u16,
+    counter: u16,
+    last_received: Instant,
+) -> bool {
+    LOGGER_DATA.lock(|data| {
+        let mut data = data.borrow_mut();
+        let is_new = data.is_none_or(|previous| previous.counter != counter);
+        *data = Some(LoggerDataSnapshot {
+            adc0,
+            adc2,
+            adc3,
+            counter,
+            last_received,
+        });
+        is_new
+    })
 }
 
 // --- Valve Angle Definitions ---
@@ -79,6 +147,8 @@ pub static INTERNAL_STATUS_FLAGS: AtomicU8 = AtomicU8::new(0);
 pub static OUTPUT_GPIO_STATUS: AtomicU8 = AtomicU8::new(0);
 pub static INPUT_GPIO_STATUS: AtomicU8 = AtomicU8::new(0);
 pub static VALVE_ANGLE_X10: AtomicI32 = AtomicI32::new(0);
+static LOGGER_DATA: Mutex<CriticalSectionRawMutex, RefCell<Option<LoggerDataSnapshot>>> =
+    Mutex::new(RefCell::new(None));
 pub static MAIN_RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static VALVE_RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static CAN_HEALTH: AtomicU8 = AtomicU8::new(CanHealth::Active as u8);

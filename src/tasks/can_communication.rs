@@ -1,6 +1,6 @@
 use core::sync::atomic::Ordering;
 use embassy_futures::select::{Either3, select3};
-use embassy_time::{Duration, Ticker, Timer, with_timeout};
+use embassy_time::{Duration, Instant, Ticker, Timer, with_timeout};
 use embedded_can::{Frame, Id};
 use esp_hal::{
     Async,
@@ -10,11 +10,13 @@ use esp_hal::{
 use crate::{
     BUTTON_STATE, ButtonFlags, CAN_HEALTH, CAN_LOCAL_ERROR, CAN_MANAGER_HEARTBEAT, CAN_REC,
     CAN_RX_ERROR_COUNT, CAN_RX_EVENT_FLAGS, CAN_RX_EVENT_INPUT_GPIO_STATUS,
-    CAN_RX_EVENT_INTERNAL_STATUS, CAN_RX_EVENT_OUTPUT_GPIO_STATUS, CAN_RX_EVENT_PEER,
-    CAN_RX_EVENT_VALVE_ANGLE, CAN_TEC, CAN_TX_ERROR_COUNT, CAN_TX_TIMEOUT_ACTIVE,
-    CAN_TX_TIMEOUT_MS, CanHealth, CanLocalError, INPUT_GPIO_STATUS, INTERNAL_STATUS_FLAGS,
-    INTERNAL_STATUS_PHASE, MAIN_RX_SIGNAL, OUTPUT_GPIO_STATUS, VALVE_ANGLE_X10, VALVE_RX_SIGNAL,
+    CAN_RX_EVENT_INTERNAL_STATUS, CAN_RX_EVENT_LOGGER_DATA_NEW, CAN_RX_EVENT_OUTPUT_GPIO_STATUS,
+    CAN_RX_EVENT_PEER, CAN_RX_EVENT_VALVE_ANGLE, CAN_TEC, CAN_TX_ERROR_COUNT,
+    CAN_TX_TIMEOUT_ACTIVE, CAN_TX_TIMEOUT_MS, CanHealth, CanLocalError, INPUT_GPIO_STATUS,
+    INTERNAL_STATUS_FLAGS, INTERNAL_STATUS_PHASE, MAIN_RX_SIGNAL, OUTPUT_GPIO_STATUS,
+    VALVE_ANGLE_X10, VALVE_RX_SIGNAL,
     can::protocol::{CanDecodeError, GseCanMessage},
+    update_logger_data,
 };
 
 const BUTTON_TX_INTERVAL_MS: u64 = 50;
@@ -205,6 +207,19 @@ fn handle_received_frame(frame: &EspTwaiFrame) -> Option<bool> {
             MAIN_RX_SIGNAL.signal(());
             CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_INTERNAL_STATUS, Ordering::Release);
             Some(has_recoverable_can_fault(flags))
+        }
+        Ok(GseCanMessage::LoggerData {
+            adc0,
+            adc2,
+            adc3,
+            counter,
+        }) => {
+            mark_peer_frame_received();
+            if update_logger_data(adc0, adc2, adc3, counter, Instant::now()) {
+                CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_LOGGER_DATA_NEW, Ordering::Release);
+                MAIN_RX_SIGNAL.signal(());
+            }
+            None
         }
         Ok(GseCanMessage::ButtonFromCtrlPanel { .. }) | Err(CanDecodeError::UnknownId(_)) => None,
         Err(CanDecodeError::InvalidDlc { .. }) => {

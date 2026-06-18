@@ -54,6 +54,7 @@ CAN protocol 定義は `src/can/protocol.rs` にあり、integrated board 側の
 | `0x103` | `OutputGpioStatus` | 1 | output GPIO bits `u8` |
 | `0x104` | `InputGpioStatus` | 1 | input GPIO bits `u8` |
 | `0x105` | `InternalStatus` | 2 | `[phase, flags]` |
+| `0x106` | `LoggerData` | 8 | little-endian `u16` `adc0`, `adc2`, `adc3`, `counter` |
 
 現行 protocol では `0x102` と `0x107` は使いません。
 
@@ -127,8 +128,11 @@ bit7 `CAN_TX_FRAME_CREATE_FAILED` はフレーム生成失敗を示すため、�
 | `0x103` | `OutputGpioStatus` | `OUTPUT_GPIO_STATUS` | `VALVE_RX_SIGNAL` |
 | `0x104` | `InputGpioStatus` | `INPUT_GPIO_STATUS` | `MAIN_RX_SIGNAL` |
 | `0x105` | `InternalStatus` | `INTERNAL_STATUS_PHASE`, `INTERNAL_STATUS_FLAGS` | `MAIN_RX_SIGNAL` |
+| `0x106` | `LoggerData` | latest logger snapshot | `MAIN_RX_SIGNAL` on new counter |
 
 `VALVE_ANGLE_X10` は CAN payload の 2 バイトを little-endian の `i16` として読み取り、0.1 度単位の角度として保存します。`can_manager_task` は受信時刻や alive/lost 判定を持たず、対象 CAN ID の状態更新後に `CAN_RX_EVENT_FLAGS` へ受信イベント bit を `fetch_or(..., Ordering::Release)` で立てます。`Signal<()>` は main 側の通信監視ループを起こす用途として使います。
+
+`LoggerData` は表示/ログ用途専用です。受信時は `adc0` / `adc2` / `adc3` / `counter` と `last_received` を snapshot として保持し、前回と異なる `counter` のときだけ新着イベントとして扱います。同じ `counter` の再受信でも値と `last_received` は更新します。`LOGGER_DATA_TIMEOUT_MS` は 1000 ms で、未受信と受信済み stale は `logger_data_freshness()` で区別します。`0x106` の有効受信も既存 `CAN_PEER_ALIVE` 判定に含めます。
 
 受信イベント bit は以下です。
 
@@ -139,6 +143,7 @@ bit7 `CAN_TX_FRAME_CREATE_FAILED` はフレーム生成失敗を示すため、�
 | 2 | `CAN_RX_EVENT_OUTPUT_GPIO_STATUS` | `OutputGpioStatus` を受信 |
 | 3 | `CAN_RX_EVENT_VALVE_ANGLE` | `MainValveAngleToCtrlPanel` を受信 |
 | 4 | `CAN_RX_EVENT_INPUT_GPIO_STATUS` | `InputGpioStatus` を受信 |
+| 5 | `CAN_RX_EVENT_LOGGER_DATA_NEW` | counter が変化した `LoggerData` を受信 |
 
 `transmit_async` / `receive_async` の `Err` は握りつぶさず、送信/受信エラー回数と最新の TEC/REC、CAN 状態に反映します。`transmit_async` は 10 ms の timeout で待ちを打ち切り、timeout 時は `CAN_TX_ERROR_COUNT` を増やして `CAN_TX_TIMEOUT_ACTIVE` を立て、health を更新して loop に戻ります。これにより相手不在や ACK なしでも CAN task が送信待ちで固まり続けません。RX FIFO の overrun または Bus-Off を検出した場合は `clear_receive_fifo()` で受信 FIFO を破棄できる構造です。
 
@@ -193,5 +198,6 @@ TWAI は `TWAI0`, `TwaiMode::Normal`, `BaudRate::B125K`, `into_async()`, `Single
 | `CAN_MANAGER_HEARTBEAT` | `AtomicU32` | `can_manager_task` の起床回数 |
 | `CAN_RX_EVENT_FLAGS` | `AtomicU8` | main 側が peer 受信時刻を更新するための受信イベント bit |
 | `CAN_TX_TIMEOUT_ACTIVE` | `AtomicBool` | 最新の CAN TX timeout 表示状態 |
+| latest logger snapshot | `Mutex<RefCell<Option<LoggerDataSnapshot>>>` | `LoggerData` の最新ADC値、counter、最終受信時刻 |
 
 `Atomic` は最新状態の共有に使い、`Signal` は監視ループの起床に使います。受信回数は数えず、通信監視では main 側が `CAN_RX_EVENT_PEER` から更新した最後の peer 受信時刻だけを見ます。

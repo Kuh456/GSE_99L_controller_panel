@@ -70,10 +70,12 @@ async fn main(spawner: Spawner) -> ! {
     let uart1_tx = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
     let uart1_rx = Input::new(peripherals.GPIO23, InputConfig::default());
     let mut state_led = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用.
-    let solenoid_power_led = Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
-    let relay_12v_led = Output::new(peripherals.GPIO27, Level::Low, OutputConfig::default());
-    let igniter_power_led = Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
-    let relay_24v_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
+    let mut solenoid_power_led =
+        Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
+    let _relay_12v_led = Output::new(peripherals.GPIO27, Level::Low, OutputConfig::default());
+    let mut igniter_power_led =
+        Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
+    let _relay_24v_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
 
     let can_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
     let can_rx = Input::new(peripherals.GPIO32, InputConfig::default());
@@ -169,7 +171,10 @@ async fn main(spawner: Spawner) -> ! {
         };
         CAN_LOCAL_ERROR.store(can_local_error as u8, Ordering::Relaxed);
 
-        if can_peer_alive && can_local_error == CanLocalError::None && !can_tx_timeout {
+        let can_status_ok =
+            can_peer_alive && can_local_error == CanLocalError::None && !can_tx_timeout;
+
+        if can_status_ok {
             // 正常時：常時点灯
             state_led.set_high();
             toggle_deadline = now + error_blink_interval;
@@ -179,6 +184,23 @@ async fn main(spawner: Spawner) -> ! {
                 state_led.toggle();
                 toggle_deadline = now + error_blink_interval;
             }
+        }
+
+        if can_status_ok {
+            let input_gpio_status = INPUT_GPIO_STATUS.load(Ordering::Relaxed);
+            if input_gpio_status & IN_SOLENOID_POWER_PRESENT != 0 {
+                solenoid_power_led.set_high();
+            } else {
+                solenoid_power_led.set_low();
+            }
+            if input_gpio_status & IN_IGNITER_POWER_PRESENT != 0 {
+                igniter_power_led.set_high();
+            } else {
+                igniter_power_led.set_low();
+            }
+        } else {
+            solenoid_power_led.set_low();
+            igniter_power_led.set_low();
         }
 
         let _ = select3(
