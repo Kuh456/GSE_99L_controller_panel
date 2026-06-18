@@ -7,25 +7,34 @@
 )]
 #![deny(clippy::large_stack_frames)]
 use c99l_controller_panel::{
-    tasks::{button_update::*, can_communication::*, pc_display::*}, // 各タスクをインポート
-    *,                                                              // 定数をインポート
+    tasks::{button_update::*, can_communication::*, lcd_display::*, pc_display::*}, // 各タスクをインポート
+    *, // 定数をインポート
 };
 
 use core::sync::atomic::Ordering;
+use display_interface_spi::SPIInterface;
 use embassy_executor::Spawner;
 use embassy_futures::select::select3;
 use embassy_time::{Duration, Instant, Timer};
+use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
-use esp_hal::uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart};
 use esp_hal::{
     clock::CpuClock,
+    delay::Delay,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
     interrupt::software::SoftwareInterruptControl,
+    spi::{
+        Mode as SpiMode,
+        master::{Config as SpiConfig, Spi},
+    },
     system::Stack,
+    time::Rate,
     timer::timg::TimerGroup,
     twai::{self, BaudRate, TwaiMode, filter::SingleStandardFilter},
+    uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart},
 };
 use esp_rtos::embassy::Executor;
+use ili9341::{DisplaySize240x320, Ili9341, Orientation};
 use static_cell::StaticCell;
 
 // This creates a default app-descriptor required by the esp-idf bootloader.
@@ -79,6 +88,9 @@ async fn main(spawner: Spawner) -> ! {
 
     let can_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
     let can_rx = Input::new(peripherals.GPIO32, InputConfig::default());
+    let lcd_dc = Output::new(peripherals.GPIO4, Level::Low, OutputConfig::default());
+    let lcd_reset = Output::new(peripherals.GPIO5, Level::Low, OutputConfig::default());
+    let lcd_cs = Output::new(peripherals.GPIO15, Level::High, OutputConfig::default());
 
     let uart1_config = UartConfig::default()
         .with_baudrate(115_200)
@@ -92,6 +104,26 @@ async fn main(spawner: Spawner) -> ! {
         .with_tx(uart1_tx)
         .into_async();
     let (_display_rx, display_tx) = uart1.split();
+    let lcd_spi = Spi::new(
+        peripherals.SPI2,
+        SpiConfig::default()
+            .with_frequency(Rate::from_mhz(20))
+            .with_mode(SpiMode::_0),
+    )
+    .unwrap()
+    .with_sck(peripherals.GPIO21)
+    .with_mosi(peripherals.GPIO19);
+    let lcd_device = ExclusiveDevice::new_no_delay(lcd_spi, lcd_cs).unwrap();
+    let lcd_interface = SPIInterface::new(lcd_device, lcd_dc);
+    let mut lcd_delay = Delay::new();
+    let lcd_display = Ili9341::new(
+        lcd_interface,
+        lcd_reset,
+        &mut lcd_delay,
+        Orientation::Landscape,
+        DisplaySize240x320,
+    )
+    .unwrap();
 
     //  Spawn some tasks
     let button_update = button_update_task(dump, fire, fill, separate, valve_set, o2, valve_open)
@@ -100,6 +132,9 @@ async fn main(spawner: Spawner) -> ! {
     let pc_display = pc_display_task(display_tx)
         .expect("pc_display_task token should be allocated during setup");
     spawner.spawn(pc_display);
+    let lcd_display = lcd_display_task(lcd_display)
+        .expect("lcd_display_task token should be allocated during setup");
+    spawner.spawn(lcd_display);
 
     esp_rtos::start_second_core(
         peripherals.CPU_CTRL,
