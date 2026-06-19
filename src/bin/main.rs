@@ -75,8 +75,8 @@ async fn main(spawner: Spawner) -> ! {
     let o2 = Input::new(peripherals.GPIO39, InputConfig::default()); // sch : SW6 酸素電磁弁用. external pull-down required.
     let valve_open = Input::new(peripherals.GPIO36, InputConfig::default()); // sch: SW7 main_valve open switch. external pull-down required.
 
-    let uart1_tx = Output::new(peripherals.GPIO22, Level::Low, OutputConfig::default());
-    let uart1_rx = Input::new(peripherals.GPIO23, InputConfig::default());
+    let uart1_tx = Output::new(peripherals.GPIO23, Level::Low, OutputConfig::default());
+    let uart1_rx = Input::new(peripherals.GPIO22, InputConfig::default());
     let mut state_led = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用.
     let mut solenoid_power_led =
         Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
