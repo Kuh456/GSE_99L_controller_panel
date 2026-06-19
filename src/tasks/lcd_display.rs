@@ -2,7 +2,6 @@ use crate::{
     ANGLE_SCALE,
     tasks::display_common::{
         DisplaySnapshot, can_is_ok, can_status_str, display_snapshot, main_sequence_state_str,
-        servo_angle_is_valid,
     },
 };
 use core::fmt::Write;
@@ -12,7 +11,8 @@ use embedded_graphics::{
     Drawable,
     mono_font::{MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::Rgb565,
-    prelude::{DrawTarget, Point, RgbColor, WebColors},
+    prelude::{DrawTarget, Point, Primitive, RgbColor, Size, WebColors},
+    primitives::{PrimitiveStyle, Rectangle},
     text::{Baseline, Text},
 };
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
@@ -40,16 +40,28 @@ const ROW_OUTPUT_2: i32 = ROW_OUTPUT_1 + ROW_H;
 const ROW_OUTPUT_3: i32 = ROW_OUTPUT_2 + ROW_H;
 const ROW_VALVE: i32 = ROW_OUTPUT_3 + ROW_H;
 const ROW_SERVO: i32 = ROW_VALVE + ROW_H;
+const FIELD_W: u32 = 236;
 const OUT_DUMP: u8 = 1 << 0;
 const OUT_IGNITER: u8 = 1 << 1;
 const OUT_FILL: u8 = 1 << 2;
 const OUT_MAIN: u8 = 1 << 4;
 const OUT_O2: u8 = 1 << 5;
+const FAULT_SERVO_COMM_ERROR: u8 = 1 << 2;
 
-fn draw_field_color<D>(display: &mut D, y: i32, text: &str, color: Rgb565) -> Result<(), D::Error>
+fn draw_field_with_style<D>(
+    display: &mut D,
+    y: i32,
+    text: &str,
+    text_color: Rgb565,
+    background_color: Rgb565,
+) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    Rectangle::new(Point::new(FIELD_X, y), Size::new(FIELD_W, ROW_H as u32))
+        .into_styled(PrimitiveStyle::with_fill(background_color))
+        .draw(display)?;
+
     let mut padded: String<48> = String::new();
     let _ = write!(padded, "{}", text);
     while padded.len() < FIELD_CHARS {
@@ -61,8 +73,8 @@ where
         Point::new(FIELD_X, y),
         MonoTextStyleBuilder::new()
             .font(&PROFONT_18_POINT)
-            .text_color(color)
-            .background_color(Rgb565::WHITE)
+            .text_color(text_color)
+            .background_color(background_color)
             .build(),
         Baseline::Top,
     )
@@ -74,7 +86,21 @@ fn draw_field<D>(display: &mut D, y: i32, text: &str) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    draw_field_color(display, y, text, Rgb565::BLACK)
+    draw_field_with_style(display, y, text, Rgb565::WHITE, Rgb565::BLACK)
+}
+
+fn draw_ok_field<D>(display: &mut D, y: i32, text: &str) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_field_with_style(display, y, text, Rgb565::GREEN, Rgb565::BLACK)
+}
+
+fn draw_error_field<D>(display: &mut D, y: i32, text: &str) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    draw_field_with_style(display, y, text, Rgb565::WHITE, Rgb565::RED)
 }
 
 fn draw_static_labels<D>(display: &mut D) -> Result<(), D::Error>
@@ -84,7 +110,7 @@ where
     Text::with_baseline(
         "GSE CTRL",
         Point::new(6, 4),
-        MonoTextStyle::new(&PROFONT_18_POINT, Rgb565::RED),
+        MonoTextStyle::new(&PROFONT_18_POINT, Rgb565::GREEN),
         Baseline::Top,
     )
     .draw(display)?;
@@ -123,7 +149,7 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     if can_is_ok(snapshot) {
-        return draw_field(display, ROW_CAN, "OK");
+        return draw_ok_field(display, ROW_CAN, "CAN OK");
     }
 
     let mut text: String<32> = String::new();
@@ -134,10 +160,10 @@ where
     );
     let _ = write!(
         text,
-        "ERROR {}",
+        "[ ERROR ] {}",
         status.strip_prefix("CAN ").unwrap_or(status)
     );
-    draw_field_color(display, ROW_CAN, text.as_str(), Rgb565::RED)
+    draw_error_field(display, ROW_CAN, text.as_str())
 }
 
 fn draw_phase<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
@@ -192,16 +218,13 @@ fn draw_valve<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Er
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let error = !snapshot.can_peer_alive
-        || !snapshot.valve_angle_received
-        || !servo_angle_is_valid(snapshot.angle_x10);
+    let error = snapshot.internal_status_flags & FAULT_SERVO_COMM_ERROR != 0;
     let text = if error { "VALVE ERROR" } else { "VALVE OK" };
-    draw_field_color(
-        display,
-        ROW_VALVE,
-        text,
-        if error { Rgb565::RED } else { Rgb565::BLACK },
-    )
+    if error {
+        draw_field_with_style(display, ROW_VALVE, text, Rgb565::WHITE, Rgb565::RED)
+    } else {
+        draw_ok_field(display, ROW_VALVE, text)
+    }
 }
 
 fn draw_servo<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
@@ -209,10 +232,22 @@ where
     D: DrawTarget<Color = Rgb565>,
 {
     if !snapshot.can_peer_alive {
-        return draw_field_color(display, ROW_SERVO, "SERVO ERROR", Rgb565::RED);
+        return draw_field_with_style(
+            display,
+            ROW_SERVO,
+            "SERVO ERROR",
+            Rgb565::WHITE,
+            Rgb565::RED,
+        );
     }
-    if !snapshot.valve_angle_received || !servo_angle_is_valid(snapshot.angle_x10) {
-        return draw_field_color(display, ROW_SERVO, "SERVO INVALID", Rgb565::RED);
+    if !snapshot.valve_angle_received {
+        return draw_field_with_style(
+            display,
+            ROW_SERVO,
+            "SERVO ERROR INVALID",
+            Rgb565::WHITE,
+            Rgb565::RED,
+        );
     }
 
     let angle_abs_x10 = snapshot.angle_x10.abs();
@@ -263,6 +298,7 @@ where
         prev.angle_x10 != snapshot.angle_x10
             || prev.valve_angle_received != snapshot.valve_angle_received
             || prev.can_peer_alive != snapshot.can_peer_alive
+            || prev.internal_status_flags != snapshot.internal_status_flags
     }) {
         draw_valve(display, snapshot)?;
         draw_servo(display, snapshot)?;
@@ -272,7 +308,7 @@ where
 
 #[embassy_executor::task]
 pub async fn lcd_display_task(mut display: LcdDisplay) {
-    display.clear(Rgb565::WHITE).unwrap();
+    display.clear(Rgb565::BLACK).unwrap();
     draw_static_labels(&mut display).unwrap();
 
     let mut previous_snapshot: Option<DisplaySnapshot> = None;

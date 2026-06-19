@@ -115,20 +115,20 @@ fn write_fault_flags(text: &mut String<1024>, flags: u8) {
 
     let mut needs_separator = false;
     if flags & INTERNAL_CAN_PEER_LOST != 0 {
-        push_fault_flag_name(text, &mut needs_separator, "CAN_PEER_LOST");
+        push_fault_flag_name(text, &mut needs_separator, "CAN_LOST");
     }
     if flags & INTERNAL_CAN_BUS_OFF != 0 {
-        push_fault_flag_name(text, &mut needs_separator, "CAN_BUS_OFF");
+        push_fault_flag_name(text, &mut needs_separator, "BUS_OFF");
     }
     if flags & INTERNAL_SERVO_COMM_ERROR != 0 {
-        push_fault_flag_name(text, &mut needs_separator, "SERVO_COMM_ERROR");
+        push_fault_flag_name(text, &mut needs_separator, "SRV_COM_ERR");
     }
-    if flags & INTERNAL_CAN_TX_TIMEOUT != 0 {
-        push_fault_flag_name(text, &mut needs_separator, "CAN_TX_TIMEOUT");
-    }
-    if flags & INTERNAL_CAN_TX_FRAME_CREATE_FAILED != 0 {
-        push_fault_flag_name(text, &mut needs_separator, "CAN_TX_FRAME_CREATE_FAILED");
-    }
+    // if flags & INTERNAL_CAN_TX_TIMEOUT != 0 {
+    //     push_fault_flag_name(text, &mut needs_separator, "CAN_TX_TIMEOUT");
+    // }
+    // if flags & INTERNAL_CAN_TX_FRAME_CREATE_FAILED != 0 {
+    //     push_fault_flag_name(text, &mut needs_separator, "CAN_TX_FRAME_CREATE_FAILED");
+    // }
 
     let unknown = flags & !INTERNAL_KNOWN_FAULT_FLAGS;
     if unknown != 0 {
@@ -176,8 +176,8 @@ async fn write_fault_status(tx: &mut UartTx<'static, Async>) {
     line.clear();
     let _ = write!(
         line,
-        "SERVO STATUS={}\r\n",
-        if servo_comm_error { "ERROR" } else { "OK" },
+        "SRV ST={}\r\n",
+        if servo_comm_error { "ERR" } else { "OK" },
     );
     write_line(tx, line.as_str()).await;
 }

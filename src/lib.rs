@@ -26,6 +26,7 @@ pub const CAN_RX_EVENT_OUTPUT_GPIO_STATUS: u8 = 1 << 2;
 pub const CAN_RX_EVENT_VALVE_ANGLE: u8 = 1 << 3;
 pub const CAN_RX_EVENT_INPUT_GPIO_STATUS: u8 = 1 << 4;
 pub const CAN_RX_EVENT_LOGGER_DATA_NEW: u8 = 1 << 5;
+pub const INITIAL_INTERNAL_STATUS_FLAGS: u8 = 1 << 2;
 
 pub const IN_SOLENOID_POWER_PRESENT: u8 = 1 << 0;
 pub const IN_RELAY_12V_ON: u8 = 1 << 1;
@@ -154,7 +155,7 @@ bitflags::bitflags! {
 pub static BUTTON_STATE: AtomicU8 = AtomicU8::new(0);
 // Raw payload state last received from the peer; local CAN errors must not overwrite these.
 pub static INTERNAL_STATUS_PHASE: AtomicU8 = AtomicU8::new(0);
-pub static INTERNAL_STATUS_FLAGS: AtomicU8 = AtomicU8::new(0);
+pub static INTERNAL_STATUS_FLAGS: AtomicU8 = AtomicU8::new(INITIAL_INTERNAL_STATUS_FLAGS);
 pub static OUTPUT_GPIO_STATUS: AtomicU8 = AtomicU8::new(0);
 pub static INPUT_GPIO_STATUS: AtomicU8 = AtomicU8::new(0);
 pub static VALVE_ANGLE_X10: AtomicI32 = AtomicI32::new(0);
