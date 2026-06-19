@@ -1,8 +1,8 @@
 use crate::{
     ANGLE_SCALE,
     tasks::display_common::{
-        ButtonDisplayBits, DisplaySnapshot, angle_status_str, can_health_str, can_status_str,
-        display_snapshot, main_sequence_state_str,
+        DisplaySnapshot, can_is_ok, can_status_str, display_snapshot, main_sequence_state_str,
+        servo_angle_is_valid,
     },
 };
 use core::fmt::Write;
@@ -10,10 +10,9 @@ use display_interface_spi::SPIInterface;
 use embassy_time::{Duration, Timer};
 use embedded_graphics::{
     Drawable,
-    mono_font::MonoTextStyle,
+    mono_font::{MonoTextStyle, MonoTextStyleBuilder},
     pixelcolor::Rgb565,
-    prelude::{DrawTarget, Point, Primitive, RgbColor, Size, WebColors},
-    primitives::{PrimitiveStyle, Rectangle},
+    prelude::{DrawTarget, Point, RgbColor, WebColors},
     text::{Baseline, Text},
 };
 use embedded_hal_bus::spi::{ExclusiveDevice, NoDelay};
@@ -31,48 +30,51 @@ pub type LcdDisplay = Ili9341<
 >;
 
 const FIELD_X: i32 = 84;
-const FIELD_W: u32 = 230;
-const FIELD_H: u32 = 20;
+const FIELD_CHARS: usize = 23;
 const ROW_H: i32 = 23;
-const ROW_BURN: i32 = 30;
+const ROW_PHASE: i32 = 30;
+const ROW_BURN: i32 = ROW_PHASE + ROW_H;
 const ROW_CAN: i32 = ROW_BURN + ROW_H;
-const ROW_PHASE: i32 = ROW_CAN + ROW_H;
-const ROW_FLAGS: i32 = ROW_PHASE + ROW_H;
-const ROW_GPIO: i32 = ROW_FLAGS + ROW_H;
-const ROW_VALVE: i32 = ROW_GPIO + ROW_H;
-const ROW_BUTTONS_1: i32 = ROW_VALVE + ROW_H;
-const ROW_BUTTONS_2: i32 = ROW_BUTTONS_1 + ROW_H;
+const ROW_OUTPUT_1: i32 = ROW_CAN + ROW_H;
+const ROW_OUTPUT_2: i32 = ROW_OUTPUT_1 + ROW_H;
+const ROW_OUTPUT_3: i32 = ROW_OUTPUT_2 + ROW_H;
+const ROW_VALVE: i32 = ROW_OUTPUT_3 + ROW_H;
+const ROW_SERVO: i32 = ROW_VALVE + ROW_H;
+const OUT_DUMP: u8 = 1 << 0;
+const OUT_IGNITER: u8 = 1 << 1;
+const OUT_FILL: u8 = 1 << 2;
+const OUT_MAIN: u8 = 1 << 4;
+const OUT_O2: u8 = 1 << 5;
 
-fn draw_text<D>(display: &mut D, text: &str, point: Point, color: Rgb565) -> Result<(), D::Error>
+fn draw_field_color<D>(display: &mut D, y: i32, text: &str, color: Rgb565) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    let mut padded: String<48> = String::new();
+    let _ = write!(padded, "{}", text);
+    while padded.len() < FIELD_CHARS {
+        let _ = padded.push(' ');
+    }
+
     Text::with_baseline(
-        text,
-        point,
-        MonoTextStyle::new(&PROFONT_18_POINT, color),
+        padded.as_str(),
+        Point::new(FIELD_X, y),
+        MonoTextStyleBuilder::new()
+            .font(&PROFONT_18_POINT)
+            .text_color(color)
+            .background_color(Rgb565::WHITE)
+            .build(),
         Baseline::Top,
     )
     .draw(display)
     .map(|_| ())
 }
 
-fn clear_field<D>(display: &mut D, y: i32) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    Rectangle::new(Point::new(FIELD_X, y), Size::new(FIELD_W, FIELD_H))
-        .into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE))
-        .draw(display)
-        .map(|_| ())
-}
-
 fn draw_field<D>(display: &mut D, y: i32, text: &str) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    clear_field(display, y)?;
-    draw_text(display, text, Point::new(FIELD_X, y), Rgb565::BLACK)
+    draw_field_color(display, y, text, Rgb565::BLACK)
 }
 
 fn draw_static_labels<D>(display: &mut D) -> Result<(), D::Error>
@@ -89,14 +91,14 @@ where
 
     let label_style = MonoTextStyle::new(&PROFONT_14_POINT, Rgb565::CSS_DIM_GRAY);
     for (label, y) in [
+        ("PHASE", ROW_PHASE),
         ("BURN", ROW_BURN),
         ("CAN", ROW_CAN),
-        ("PHASE", ROW_PHASE),
-        ("FLAGS", ROW_FLAGS),
-        ("GPIO", ROW_GPIO),
+        ("OUT1", ROW_OUTPUT_1),
+        ("OUT2", ROW_OUTPUT_2),
+        ("OUT3", ROW_OUTPUT_3),
         ("VALVE", ROW_VALVE),
-        ("BTN1", ROW_BUTTONS_1),
-        ("BTN2", ROW_BUTTONS_2),
+        ("SERVO", ROW_SERVO),
     ] {
         Text::with_baseline(label, Point::new(6, y + 2), label_style, Baseline::Top)
             .draw(display)?;
@@ -120,18 +122,22 @@ fn draw_can<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Erro
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let mut text: String<48> = String::new();
+    if can_is_ok(snapshot) {
+        return draw_field(display, ROW_CAN, "OK");
+    }
+
+    let mut text: String<32> = String::new();
+    let status = can_status_str(
+        snapshot.can_peer_alive,
+        snapshot.can_local_error,
+        snapshot.can_tx_timeout,
+    );
     let _ = write!(
         text,
-        "{} {}",
-        can_status_str(
-            snapshot.can_peer_alive,
-            snapshot.can_local_error,
-            snapshot.can_tx_timeout
-        ),
-        can_health_str(snapshot.can_health)
+        "ERROR {}",
+        status.strip_prefix("CAN ").unwrap_or(status)
     );
-    draw_field(display, ROW_CAN, text.as_str())
+    draw_field_color(display, ROW_CAN, text.as_str(), Rgb565::RED)
 }
 
 fn draw_phase<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
@@ -145,69 +151,80 @@ where
     )
 }
 
-fn draw_flags<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    let mut text: String<16> = String::new();
-    let _ = write!(text, "0x{:02X}", snapshot.internal_status_flags);
-    draw_field(display, ROW_FLAGS, text.as_str())
+fn on_off(active: bool) -> &'static str {
+    if active { "ON" } else { "OFF" }
 }
 
-fn draw_gpio<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
+fn draw_output_gpio<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
-    let mut text: String<32> = String::new();
+    let output = snapshot.output_gpio_status;
+    let mut text: String<40> = String::new();
     let _ = write!(
         text,
-        "OUT:0x{:02X} IN:0x{:02X}",
-        snapshot.output_gpio_status, snapshot.input_gpio_status
+        "DMP:{} FIL:{}",
+        on_off(output & OUT_DUMP != 0),
+        on_off(output & OUT_FILL != 0),
     );
-    draw_field(display, ROW_GPIO, text.as_str())
+    draw_field(display, ROW_OUTPUT_1, text.as_str())?;
+
+    text.clear();
+    let _ = write!(
+        text,
+        "IGN:{} MAIN:{}",
+        on_off(output & OUT_IGNITER != 0),
+        on_off(output & OUT_MAIN != 0),
+    );
+    draw_field(display, ROW_OUTPUT_2, text.as_str())?;
+
+    text.clear();
+    let _ = write!(
+        text,
+        "O2:{} SET:{}",
+        on_off(output & OUT_O2 != 0),
+        on_off(snapshot.buttons.valve_set != 0),
+    );
+    draw_field(display, ROW_OUTPUT_3, text.as_str())
 }
 
 fn draw_valve<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    let error = !snapshot.can_peer_alive
+        || !snapshot.valve_angle_received
+        || !servo_angle_is_valid(snapshot.angle_x10);
+    let text = if error { "VALVE ERROR" } else { "VALVE OK" };
+    draw_field_color(
+        display,
+        ROW_VALVE,
+        text,
+        if error { Rgb565::RED } else { Rgb565::BLACK },
+    )
+}
+
+fn draw_servo<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = Rgb565>,
+{
+    if !snapshot.can_peer_alive {
+        return draw_field_color(display, ROW_SERVO, "SERVO ERROR", Rgb565::RED);
+    }
+    if !snapshot.valve_angle_received || !servo_angle_is_valid(snapshot.angle_x10) {
+        return draw_field_color(display, ROW_SERVO, "SERVO INVALID", Rgb565::RED);
+    }
+
     let angle_abs_x10 = snapshot.angle_x10.abs();
     let mut text: String<40> = String::new();
     let _ = write!(
         text,
-        "{} {}{}.{:01}deg",
-        angle_status_str(snapshot.angle_x10),
+        "SERVO {}{}.{:01}deg",
         if snapshot.angle_x10 < 0 { "-" } else { "" },
         angle_abs_x10 / ANGLE_SCALE,
         angle_abs_x10 % ANGLE_SCALE
     );
-    draw_field(display, ROW_VALVE, text.as_str())
-}
-
-fn draw_buttons_1<D>(display: &mut D, buttons: ButtonDisplayBits) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    let mut text: String<40> = String::new();
-    let _ = write!(
-        text,
-        "DMP:{} FIR:{} FIL:{} SEP:{}",
-        buttons.dump, buttons.fire, buttons.fill, buttons.separate
-    );
-    draw_field(display, ROW_BUTTONS_1, text.as_str())
-}
-
-fn draw_buttons_2<D>(display: &mut D, buttons: ButtonDisplayBits) -> Result<(), D::Error>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    let mut text: String<32> = String::new();
-    let _ = write!(
-        text,
-        "SET:{} O2:{} VLV:{}",
-        buttons.valve_set, buttons.o2, buttons.valve_open
-    );
-    draw_field(display, ROW_BUTTONS_2, text.as_str())
+    draw_field(display, ROW_SERVO, text.as_str())
 }
 
 fn draw_changed_fields<D>(
@@ -236,23 +253,20 @@ where
     if previous.is_none_or(|prev| prev.main_sequence_state != snapshot.main_sequence_state) {
         draw_phase(display, snapshot)?;
     }
-    if previous.is_none_or(|prev| prev.internal_status_flags != snapshot.internal_status_flags) {
-        draw_flags(display, snapshot)?;
-    }
     if previous.is_none_or(|prev| {
         prev.output_gpio_status != snapshot.output_gpio_status
-            || prev.input_gpio_status != snapshot.input_gpio_status
+            || prev.buttons.valve_set != snapshot.buttons.valve_set
     }) {
-        draw_gpio(display, snapshot)?;
+        draw_output_gpio(display, snapshot)?;
     }
-    if previous.is_none_or(|prev| prev.angle_x10 != snapshot.angle_x10) {
+    if previous.is_none_or(|prev| {
+        prev.angle_x10 != snapshot.angle_x10
+            || prev.valve_angle_received != snapshot.valve_angle_received
+            || prev.can_peer_alive != snapshot.can_peer_alive
+    }) {
         draw_valve(display, snapshot)?;
+        draw_servo(display, snapshot)?;
     }
-    if previous.is_none_or(|prev| prev.buttons != snapshot.buttons) {
-        draw_buttons_1(display, snapshot.buttons)?;
-        draw_buttons_2(display, snapshot.buttons)?;
-    }
-
     Ok(())
 }
 

@@ -14,7 +14,6 @@ use c99l_controller_panel::{
 use core::sync::atomic::Ordering;
 use display_interface_spi::SPIInterface;
 use embassy_executor::Spawner;
-use embassy_futures::select::select3;
 use embassy_time::{Duration, Instant, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use esp_backtrace as _;
@@ -81,10 +80,10 @@ async fn main(spawner: Spawner) -> ! {
     let mut state_led = Output::new(peripherals.GPIO13, Level::Low, OutputConfig::default()); // sch: Logic_LED 制御基板とのCAN通信の状態表示用.
     let mut solenoid_power_led =
         Output::new(peripherals.GPIO14, Level::Low, OutputConfig::default());
-    let _relay_12v_led = Output::new(peripherals.GPIO27, Level::Low, OutputConfig::default());
+    let mut relay_12v_led = Output::new(peripherals.GPIO27, Level::Low, OutputConfig::default());
     let mut igniter_power_led =
         Output::new(peripherals.GPIO26, Level::Low, OutputConfig::default());
-    let _relay_24v_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
+    let mut relay_24v_led = Output::new(peripherals.GPIO25, Level::Low, OutputConfig::default());
 
     let can_tx = Output::new(peripherals.GPIO33, Level::Low, OutputConfig::default());
     let can_rx = Input::new(peripherals.GPIO32, InputConfig::default());
@@ -228,22 +227,26 @@ async fn main(spawner: Spawner) -> ! {
             } else {
                 solenoid_power_led.set_low();
             }
+            if input_gpio_status & IN_RELAY_12V_ON != 0 {
+                relay_12v_led.set_high();
+            } else {
+                relay_12v_led.set_low();
+            }
             if input_gpio_status & IN_IGNITER_POWER_PRESENT != 0 {
                 igniter_power_led.set_high();
             } else {
                 igniter_power_led.set_low();
             }
+            if input_gpio_status & IN_RELAY_24V_ON != 0 {
+                relay_24v_led.set_high();
+            } else {
+                relay_24v_led.set_low();
+            }
         } else {
-            solenoid_power_led.set_low();
-            igniter_power_led.set_low();
+            // Do nothing.Hold the Power LED state
         }
 
-        let _ = select3(
-            MAIN_RX_SIGNAL.wait(),
-            VALVE_RX_SIGNAL.wait(),
-            Timer::after(Duration::from_millis(100)),
-        )
-        .await;
+        Timer::after(Duration::from_millis(100)).await;
         // esp_println::println!("main loop");
     }
 }

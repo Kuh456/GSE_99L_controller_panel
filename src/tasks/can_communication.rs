@@ -13,8 +13,8 @@ use crate::{
     CAN_RX_EVENT_INTERNAL_STATUS, CAN_RX_EVENT_LOGGER_DATA_NEW, CAN_RX_EVENT_OUTPUT_GPIO_STATUS,
     CAN_RX_EVENT_PEER, CAN_RX_EVENT_VALVE_ANGLE, CAN_TEC, CAN_TX_ERROR_COUNT,
     CAN_TX_TIMEOUT_ACTIVE, CAN_TX_TIMEOUT_MS, CanHealth, CanLocalError, INPUT_GPIO_STATUS,
-    INTERNAL_STATUS_FLAGS, INTERNAL_STATUS_PHASE, MAIN_RX_SIGNAL, OUTPUT_GPIO_STATUS,
-    VALVE_ANGLE_X10, VALVE_RX_SIGNAL,
+    INTERNAL_STATUS_FLAGS, INTERNAL_STATUS_PHASE, LOGGER_DATA_QUEUE, LoggerDataSample,
+    MAIN_RX_SIGNAL, OUTPUT_GPIO_STATUS, VALVE_ANGLE_RECEIVED, VALVE_ANGLE_X10, VALVE_RX_SIGNAL,
     can::protocol::{CanDecodeError, GseCanMessage},
     update_logger_data,
 };
@@ -36,6 +36,8 @@ pub async fn can_manager_task(mut can: twai::Twai<'static, Async>) {
     let mut health_ticker = Ticker::every(Duration::from_millis(CAN_HEALTH_MONITOR_INTERVAL_MS));
     let mut reset_ack_pending = false;
     let mut reset_ack_gap_pending = false;
+    let mut previous_logger_counter = None;
+    let mut previous_logger_received = None;
 
     update_can_health(&can);
 
@@ -51,7 +53,13 @@ pub async fn can_manager_task(mut can: twai::Twai<'static, Async>) {
         {
             Either3::First(receive_result) => match receive_result {
                 Ok(frame) => {
-                    if let Some(has_fault) = handle_received_frame(&frame) {
+                    if let Some(has_fault) = handle_received_frame(
+                        &frame,
+                        &mut previous_logger_counter,
+                        &mut previous_logger_received,
+                    )
+                    .await
+                    {
                         reset_ack_pending = has_fault;
                         if !has_fault {
                             reset_ack_gap_pending = false;
@@ -172,7 +180,11 @@ fn record_invalid_peer_payload() {
     CAN_RX_ERROR_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
-fn handle_received_frame(frame: &EspTwaiFrame) -> Option<bool> {
+async fn handle_received_frame(
+    frame: &EspTwaiFrame,
+    previous_logger_counter: &mut Option<u16>,
+    previous_logger_received: &mut Option<Instant>,
+) -> Option<bool> {
     let id = match frame.id() {
         Id::Standard(s_id) => s_id.as_raw(),
         Id::Extended(_) => return None,
@@ -182,6 +194,7 @@ fn handle_received_frame(frame: &EspTwaiFrame) -> Option<bool> {
         Ok(GseCanMessage::MainValveAngleToCtrlPanel { angle_x10 }) => {
             mark_peer_frame_received();
             VALVE_ANGLE_X10.store(i32::from(angle_x10), Ordering::Relaxed);
+            VALVE_ANGLE_RECEIVED.store(true, Ordering::Relaxed);
             VALVE_RX_SIGNAL.signal(());
             CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_VALVE_ANGLE, Ordering::Release);
             None
@@ -215,10 +228,38 @@ fn handle_received_frame(frame: &EspTwaiFrame) -> Option<bool> {
             counter,
         }) => {
             mark_peer_frame_received();
-            if update_logger_data(adc0, adc2, adc3, counter, Instant::now()) {
+            let now = Instant::now();
+            let delta_ms = previous_logger_received
+                .map(|previous| now.duration_since(previous).as_millis() as u32);
+            let missed_by_counter = previous_logger_counter.map_or(0, |previous| {
+                let expected = previous.wrapping_add(1);
+                if counter == expected {
+                    0
+                } else {
+                    counter.wrapping_sub(expected)
+                }
+            });
+
+            if update_logger_data(adc0, adc2, adc3, counter, now) {
                 CAN_RX_EVENT_FLAGS.fetch_or(CAN_RX_EVENT_LOGGER_DATA_NEW, Ordering::Release);
                 MAIN_RX_SIGNAL.signal(());
             }
+
+            let sample = LoggerDataSample {
+                adc0,
+                adc2,
+                adc3,
+                counter,
+                delta_ms,
+                missed_by_counter,
+            };
+
+            *previous_logger_counter = Some(counter);
+            *previous_logger_received = Some(now);
+
+            // This intentionally prioritizes software-queue losslessness. If the
+            // UART drain side cannot keep up and the queue fills, the CAN task can stall.
+            LOGGER_DATA_QUEUE.send(sample).await;
             None
         }
         Ok(GseCanMessage::ButtonFromCtrlPanel { .. }) | Err(CanDecodeError::UnknownId(_)) => None,

@@ -2,9 +2,11 @@ use crate::{
     ANGLE_SCALE, ANGLE_STATUS_TOLERANCE_DEG, BUTTON_STATE, ButtonFlags, CAN_HEALTH,
     CAN_LOCAL_ERROR, CAN_PEER_ALIVE, CAN_TX_TIMEOUT_ACTIVE, CanHealth, CanLocalError,
     INPUT_GPIO_STATUS, INTERNAL_STATUS_FLAGS, INTERNAL_STATUS_PHASE, MAIN_VALVE_CLOSED_ANGLE_X10,
-    MAIN_VALVE_OPEN_ANGLE_X10, OUTPUT_GPIO_STATUS, VALVE_ANGLE_X10,
+    MAIN_VALVE_OPEN_ANGLE_X10, OUTPUT_GPIO_STATUS, VALVE_ANGLE_RECEIVED, VALVE_ANGLE_X10,
 };
 use core::sync::atomic::Ordering;
+
+const SERVO_ANGLE_LIMIT_X10: i32 = 180 * ANGLE_SCALE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ButtonDisplayBits {
@@ -28,6 +30,7 @@ pub struct DisplaySnapshot {
     pub can_local_error: u8,
     pub can_tx_timeout: bool,
     pub can_health: u8,
+    pub valve_angle_received: bool,
     pub buttons: ButtonDisplayBits,
 }
 
@@ -59,6 +62,7 @@ pub fn display_snapshot() -> DisplaySnapshot {
         can_local_error: CAN_LOCAL_ERROR.load(Ordering::Relaxed),
         can_tx_timeout: CAN_TX_TIMEOUT_ACTIVE.load(Ordering::Relaxed),
         can_health: CAN_HEALTH.load(Ordering::Relaxed),
+        valve_angle_received: VALVE_ANGLE_RECEIVED.load(Ordering::Relaxed),
         buttons: button_display_bits(buttons),
     }
 }
@@ -93,6 +97,13 @@ pub fn can_status_str(peer_alive: bool, local_error: u8, tx_timeout: bool) -> &'
     }
 }
 
+pub fn can_is_ok(snapshot: DisplaySnapshot) -> bool {
+    snapshot.can_peer_alive
+        && snapshot.can_local_error == CanLocalError::None as u8
+        && !snapshot.can_tx_timeout
+        && snapshot.can_health == CanHealth::Active as u8
+}
+
 pub fn angle_status_str(angle_x10: i32) -> &'static str {
     let open_angle_x10 = i32::from(MAIN_VALVE_OPEN_ANGLE_X10);
     let close_angle_x10 = i32::from(MAIN_VALVE_CLOSED_ANGLE_X10);
@@ -105,4 +116,8 @@ pub fn angle_status_str(angle_x10: i32) -> &'static str {
         return "Open!";
     }
     "Invalid"
+}
+
+pub fn servo_angle_is_valid(angle_x10: i32) -> bool {
+    angle_x10.abs() <= SERVO_ANGLE_LIMIT_X10
 }

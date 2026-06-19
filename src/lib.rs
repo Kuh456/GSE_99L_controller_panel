@@ -5,6 +5,7 @@ use core::{
 };
 use embassy_sync::{
     blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
+    channel::Channel,
     signal::Signal,
 };
 use embassy_time::{Duration, Instant};
@@ -55,6 +56,16 @@ pub struct LoggerDataSnapshot {
     pub adc3: u16,
     pub counter: u16,
     pub last_received: Instant,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoggerDataSample {
+    pub adc0: u16,
+    pub adc2: u16,
+    pub adc3: u16,
+    pub counter: u16,
+    pub delta_ms: Option<u32>,
+    pub missed_by_counter: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,8 +158,11 @@ pub static INTERNAL_STATUS_FLAGS: AtomicU8 = AtomicU8::new(0);
 pub static OUTPUT_GPIO_STATUS: AtomicU8 = AtomicU8::new(0);
 pub static INPUT_GPIO_STATUS: AtomicU8 = AtomicU8::new(0);
 pub static VALVE_ANGLE_X10: AtomicI32 = AtomicI32::new(0);
+pub static VALVE_ANGLE_RECEIVED: AtomicBool = AtomicBool::new(false);
 static LOGGER_DATA: Mutex<CriticalSectionRawMutex, RefCell<Option<LoggerDataSnapshot>>> =
     Mutex::new(RefCell::new(None));
+pub static LOGGER_DATA_QUEUE: Channel<CriticalSectionRawMutex, LoggerDataSample, 128> =
+    Channel::new();
 pub static MAIN_RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static VALVE_RX_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 pub static CAN_HEALTH: AtomicU8 = AtomicU8::new(CanHealth::Active as u8);
