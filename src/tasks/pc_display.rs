@@ -1,10 +1,7 @@
 use crate::{
     CAN_PEER_ALIVE, CAN_TX_TIMEOUT_ACTIVE, CanLocalError, INTERNAL_STATUS_FLAGS,
-    INTERNAL_STATUS_PHASE, LOGGER_DATA_QUEUE, LoggerDataSample, VALVE_ANGLE_RECEIVED,
-    VALVE_ANGLE_X10,
-    tasks::display_common::{
-        can_health_str, can_is_ok, display_snapshot, main_sequence_state_str, servo_angle_is_valid,
-    },
+    INTERNAL_STATUS_PHASE, LOGGER_DATA_QUEUE, LoggerDataSample,
+    tasks::display_common::{can_health_str, can_is_ok, display_snapshot, main_sequence_state_str},
 };
 use core::{fmt::Write, sync::atomic::Ordering};
 use embassy_sync::channel::TryReceiveError;
@@ -17,12 +14,16 @@ const PC_LOGGER_DISPLAY_INTERVAL_MS: u64 = 500;
 const PC_FAULT_DISPLAY_INTERVAL_MS: u64 = 2000;
 const VOLTAGE_REF_5V: f32 = 4.99;
 const ADC_TO_RATIO: f32 = 0.0002442;
-const IB_CAN_PEER_LOST: u8 = 1 << 0;
-const IB_CAN_BUS_OFF: u8 = 1 << 1;
-const IB_CAN_TX_TIMEOUT: u8 = 1 << 6;
-const IB_CAN_TX_FRAME_CREATE_FAILED: u8 = 1 << 7;
-const IB_KNOWN_FAULT_FLAGS: u8 =
-    IB_CAN_PEER_LOST | IB_CAN_BUS_OFF | IB_CAN_TX_TIMEOUT | IB_CAN_TX_FRAME_CREATE_FAILED;
+const INTERNAL_CAN_PEER_LOST: u8 = 1 << 0;
+const INTERNAL_CAN_BUS_OFF: u8 = 1 << 1;
+const INTERNAL_SERVO_COMM_ERROR: u8 = 1 << 2;
+const INTERNAL_CAN_TX_TIMEOUT: u8 = 1 << 6;
+const INTERNAL_CAN_TX_FRAME_CREATE_FAILED: u8 = 1 << 7;
+const INTERNAL_KNOWN_FAULT_FLAGS: u8 = INTERNAL_CAN_PEER_LOST
+    | INTERNAL_CAN_BUS_OFF
+    | INTERNAL_SERVO_COMM_ERROR
+    | INTERNAL_CAN_TX_TIMEOUT
+    | INTERNAL_CAN_TX_FRAME_CREATE_FAILED;
 
 async fn write_line(tx: &mut UartTx<'static, Async>, line: &str) {
     if tx.write_async(line.as_bytes()).await.is_err() {
@@ -93,41 +94,51 @@ fn can_local_error_str(error: u8) -> &'static str {
     }
 }
 
-fn push_flag_name(text: &mut String<256>, needs_separator: &mut bool, name: &str) {
+fn push_fault_flag_name(text: &mut String<1024>, needs_separator: &mut bool, name: &str) {
     if *needs_separator {
-        let _ = write!(text, "|");
+        let _ = write!(text, ", ");
     }
     let _ = write!(text, "{}", name);
     *needs_separator = true;
 }
 
-fn write_internal_flags(text: &mut String<256>, flags: u8) {
+fn write_fault_flags(text: &mut String<1024>, flags: u8) {
+    let _ = write!(
+        text,
+        "internal_flags: raw=0x{flags:02X} fault_flags: 0x{flags:02X} ["
+    );
+
     if flags == 0 {
-        let _ = write!(text, "NONE");
+        let _ = write!(text, "none]");
         return;
     }
 
     let mut needs_separator = false;
-    if flags & IB_CAN_PEER_LOST != 0 {
-        push_flag_name(text, &mut needs_separator, "IB_CAN_PEER_LOST");
+    if flags & INTERNAL_CAN_PEER_LOST != 0 {
+        push_fault_flag_name(text, &mut needs_separator, "CAN_PEER_LOST");
     }
-    if flags & IB_CAN_BUS_OFF != 0 {
-        push_flag_name(text, &mut needs_separator, "IB_CAN_BUS_OFF");
+    if flags & INTERNAL_CAN_BUS_OFF != 0 {
+        push_fault_flag_name(text, &mut needs_separator, "CAN_BUS_OFF");
     }
-    if flags & IB_CAN_TX_TIMEOUT != 0 {
-        push_flag_name(text, &mut needs_separator, "IB_CAN_TX_TIMEOUT");
+    if flags & INTERNAL_SERVO_COMM_ERROR != 0 {
+        push_fault_flag_name(text, &mut needs_separator, "SERVO_COMM_ERROR");
     }
-    if flags & IB_CAN_TX_FRAME_CREATE_FAILED != 0 {
-        push_flag_name(text, &mut needs_separator, "IB_CAN_TX_FRAME_CREATE_FAILED");
+    if flags & INTERNAL_CAN_TX_TIMEOUT != 0 {
+        push_fault_flag_name(text, &mut needs_separator, "CAN_TX_TIMEOUT");
+    }
+    if flags & INTERNAL_CAN_TX_FRAME_CREATE_FAILED != 0 {
+        push_fault_flag_name(text, &mut needs_separator, "CAN_TX_FRAME_CREATE_FAILED");
     }
 
-    let unknown = flags & !IB_KNOWN_FAULT_FLAGS;
+    let unknown = flags & !INTERNAL_KNOWN_FAULT_FLAGS;
     if unknown != 0 {
         if needs_separator {
-            let _ = write!(text, "|");
+            let _ = write!(text, ", ");
         }
-        let _ = write!(text, "UNKNOWN_FLAGS=0x{:02X}", unknown);
+        let _ = write!(text, "UNKNOWN=0x{:02X}", unknown);
     }
+
+    let _ = write!(text, "]");
 }
 
 async fn write_fault_status(tx: &mut UartTx<'static, Async>) {
@@ -135,20 +146,15 @@ async fn write_fault_status(tx: &mut UartTx<'static, Async>) {
     let can_tx_timeout = CAN_TX_TIMEOUT_ACTIVE.load(Ordering::Relaxed);
     let can_peer_alive = CAN_PEER_ALIVE.load(Ordering::Relaxed);
     let internal_flags = INTERNAL_STATUS_FLAGS.load(Ordering::Relaxed);
-    let angle_received = VALVE_ANGLE_RECEIVED.load(Ordering::Relaxed);
-    let angle_x10 = VALVE_ANGLE_X10.load(Ordering::Relaxed);
-    let servo_invalid = !angle_received || !servo_angle_is_valid(angle_x10);
-    let has_fault = !can_peer_alive
-        || !can_is_ok(snapshot)
-        || can_tx_timeout
-        || internal_flags != 0
-        || servo_invalid;
+    let servo_comm_error = internal_flags & INTERNAL_SERVO_COMM_ERROR != 0;
+    let has_fault =
+        !can_peer_alive || !can_is_ok(snapshot) || can_tx_timeout || internal_flags != 0;
 
     if !has_fault {
         return;
     }
 
-    let mut line: String<256> = String::new();
+    let mut line: String<1024> = String::new();
     let _ = write!(
         line,
         "CAN HEALTH={} PEER={} LOCAL={}\r\n",
@@ -159,8 +165,7 @@ async fn write_fault_status(tx: &mut UartTx<'static, Async>) {
     write_line(tx, line.as_str()).await;
 
     line.clear();
-    let _ = write!(line, "IB FLAGS=");
-    write_internal_flags(&mut line, internal_flags);
+    write_fault_flags(&mut line, internal_flags);
     let _ = write!(
         line,
         " PHASE={}\r\n",
@@ -169,17 +174,12 @@ async fn write_fault_status(tx: &mut UartTx<'static, Async>) {
     write_line(tx, line.as_str()).await;
 
     line.clear();
-    if angle_received {
-        let _ = write!(
-            line,
-            "SERVO STATUS={}\r\n",
-            if servo_invalid { "INVALID" } else { "OK" },
-        );
-    } else {
-        let _ = write!(line, "SERVO STATUS=NOT_RECEIVED\r\n");
-    }
+    let _ = write!(
+        line,
+        "SERVO STATUS={}\r\n",
+        if servo_comm_error { "ERROR" } else { "OK" },
+    );
     write_line(tx, line.as_str()).await;
-
 }
 
 #[embassy_executor::task]
