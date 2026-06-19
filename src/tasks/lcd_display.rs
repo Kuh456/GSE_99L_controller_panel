@@ -42,10 +42,10 @@ const ROW_VALVE: i32 = ROW_OUTPUT_3 + ROW_H;
 const ROW_SERVO: i32 = ROW_VALVE + ROW_H;
 const FIELD_W: u32 = 236;
 const OUT_DUMP: u8 = 1 << 0;
-const OUT_IGNITER: u8 = 1 << 1;
-const OUT_FILL: u8 = 1 << 2;
-const OUT_MAIN: u8 = 1 << 4;
-const OUT_O2: u8 = 1 << 5;
+const OUT_FILL: u8 = 1 << 1;
+const OUT_SEPARATE: u8 = 1 << 2;
+const OUT_O2: u8 = 1 << 3;
+const OUT_IGNITER: u8 = 1 << 4;
 const FAULT_SERVO_COMM_ERROR: u8 = 1 << 2;
 
 fn draw_field_with_style<D>(
@@ -198,19 +198,14 @@ where
     text.clear();
     let _ = write!(
         text,
-        "IGN:{} MAIN:{}",
-        on_off(output & OUT_IGNITER != 0),
-        on_off(output & OUT_MAIN != 0),
+        "SEP:{} O2:{}",
+        on_off(output & OUT_SEPARATE != 0),
+        on_off(output & OUT_O2 != 0),
     );
     draw_field(display, ROW_OUTPUT_2, text.as_str())?;
 
     text.clear();
-    let _ = write!(
-        text,
-        "O2:{} SET:{}",
-        on_off(output & OUT_O2 != 0),
-        on_off(snapshot.buttons.valve_set != 0),
-    );
+    let _ = write!(text, "IGN:{}", on_off(output & OUT_IGNITER != 0));
     draw_field(display, ROW_OUTPUT_3, text.as_str())
 }
 
@@ -288,10 +283,7 @@ where
     if previous.is_none_or(|prev| prev.main_sequence_state != snapshot.main_sequence_state) {
         draw_phase(display, snapshot)?;
     }
-    if previous.is_none_or(|prev| {
-        prev.output_gpio_status != snapshot.output_gpio_status
-            || prev.buttons.valve_set != snapshot.buttons.valve_set
-    }) {
+    if previous.is_none_or(|prev| prev.output_gpio_status != snapshot.output_gpio_status) {
         draw_output_gpio(display, snapshot)?;
     }
     if previous.is_none_or(|prev| {

@@ -119,7 +119,7 @@ async fn main(spawner: Spawner) -> ! {
         lcd_interface,
         lcd_reset,
         &mut lcd_delay,
-        Orientation::Landscape,
+        Orientation::LandscapeFlipped,
         DisplaySize240x320,
     )
     .unwrap();
