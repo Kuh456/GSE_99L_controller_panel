@@ -123,7 +123,7 @@ where
         ("OUT1", ROW_OUTPUT_1),
         ("OUT2", ROW_OUTPUT_2),
         ("OUT3", ROW_OUTPUT_3),
-        ("VALVE", ROW_VALVE),
+        ("COMM", ROW_VALVE),
         ("SERVO", ROW_SERVO),
     ] {
         Text::with_baseline(label, Point::new(6, y + 2), label_style, Baseline::Top)
@@ -209,12 +209,16 @@ where
     draw_field(display, ROW_OUTPUT_3, text.as_str())
 }
 
-fn draw_valve<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
+fn draw_servo_comm<D>(display: &mut D, snapshot: DisplaySnapshot) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = Rgb565>,
 {
     let error = snapshot.internal_status_flags & FAULT_SERVO_COMM_ERROR != 0;
-    let text = if error { "VALVE ERROR" } else { "VALVE OK" };
+    let text = if error {
+        "SERVO COMM ERR"
+    } else {
+        "SERVO COMM OK"
+    };
     if error {
         draw_field_with_style(display, ROW_VALVE, text, Rgb565::WHITE, Rgb565::RED)
     } else {
@@ -292,7 +296,7 @@ where
             || prev.can_peer_alive != snapshot.can_peer_alive
             || prev.internal_status_flags != snapshot.internal_status_flags
     }) {
-        draw_valve(display, snapshot)?;
+        draw_servo_comm(display, snapshot)?;
         draw_servo(display, snapshot)?;
     }
     Ok(())
